@@ -1,10 +1,10 @@
 protocol: job-spec/1
 name: noop
-bundle_hash: b1bc65b44476217065332b3a153280c0c973896de3e11e931339fb47aaf044c5
-image: ghcr.io/halbritt/runpod-jobrunner-noop@sha256:5af86dff601ba600860c9d5b7d7d4dabaf3f9101e8809bfba8279d7714c3d443
+bundle_hash: c65962afe35353df473795b305fc983de938102d87e12e4895833b4d4b5c3f5d
+image: ghcr.io/halbritt/runpod-jobrunner-noop@sha256:a2241f651117dbee72ca1f661ead87b32df3f7bd2dc4162dcf6e37097bbd0632
 runner:
-  version: 0.1.3
-  git_commit: e0df1bd99314867d25c37fa486b9f159c98c0728
+  version: 0.1.4
+  git_commit: 9a93f9dae9a9b40670ebb14c11d87f4449f48272
 resources:
   gpu_types:
     - NVIDIA RTX 2000 Ada Generation
