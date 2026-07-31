@@ -1,0 +1,11 @@
+{
+  "protocol": "input-manifest/1",
+  "root": "inputs",
+  "files": [
+    {
+      "path": "message.txt",
+      "sha256": "dde16a68219372268c8e78b1fefba03fc7f156b69ee60b026d29cf10de762c3b",
+      "size": 28
+    }
+  ]
+}

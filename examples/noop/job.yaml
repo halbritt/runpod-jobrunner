@@ -1,0 +1,47 @@
+protocol: job-spec/1
+name: noop
+bundle_hash: 1adf0f7a5fbfd1420d09e18450067d239e1a53eba8745594bd4d9492705d1403
+image: ghcr.io/halbritt/runpod-jobrunner-noop@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+runner:
+  version: 0.1.0
+resources:
+  gpu_types:
+    - NVIDIA RTX 2000 Ada Generation
+  gpu_count: 1
+  storage:
+    encrypted: true
+    mount: /workspace
+    required_gb: 10
+inputs:
+  manifest: input-manifest.json
+phases:
+  verify:
+    enabled: true
+    argv: [/opt/runpod-jobrunner/noop, verify]
+    timeout_seconds: 60
+  preflight:
+    enabled: true
+    argv: [/opt/runpod-jobrunner/noop, preflight, --sleep-seconds, '45']
+    timeout_seconds: 90
+  train:
+    enabled: false
+    argv: []
+    timeout_seconds: 60
+  evaluate:
+    enabled: false
+    argv: []
+    timeout_seconds: 60
+  package:
+    enabled: true
+    argv: [/opt/runpod-jobrunner/noop, package]
+    timeout_seconds: 60
+limits:
+  max_elapsed_seconds: 600
+  max_cost_usd: "0.50"
+  usd_per_hour: "0.24"
+heartbeat_interval_seconds: 5
+termination_grace_seconds: 10
+artifacts:
+  manifest_path: artifacts/manifest.json
+lifecycle:
+  delete_after_terminal: true

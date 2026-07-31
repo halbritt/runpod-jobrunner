@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runpod-jobrunner.local/schemas/run-event-1.json",
+  "title": "runpod-jobrunner run-event/1",
+  "type": "object",
+  "required": ["protocol", "sequence", "kind"],
+  "properties": {
+    "protocol": {"const": "run-event/1"},
+    "run_id": {"$ref": "#/$defs/run-id"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "kind": {"type": "string", "minLength": 1},
+    "phase": {
+      "type": ["string", "null"],
+      "enum": ["verify", "preflight", "train", "evaluate", "package", null]
+    },
+    "monotonic_seconds": {"type": "number", "minimum": 0},
+    "recorded_at_unix": {"type": "number", "minimum": 0},
+    "exit_code": {"type": "integer"},
+    "outcome": {
+      "enum": ["succeeded", "failed", "stopped", "timed_out", "limit_exceeded"]
+    },
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object"},
+    "projection": {"type": "object"}
+  },
+  "anyOf": [
+    {
+      "title": "remote runner event",
+      "required": ["run_id", "phase", "monotonic_seconds", "recorded_at_unix"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "ready",
+            "runner_resumed",
+            "phase_started",
+            "phase_completed",
+            "phase_failed",
+            "phase_start_failed",
+            "phase_disabled",
+            "terminal"
+          ]
+        }
+      }
+    },
+    {
+      "title": "local controller journal event",
+      "required": ["recorded_at", "payload", "projection"]
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "run-id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    }
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runpod-jobrunner.local/schemas/closeout-receipt-1.json",
+  "title": "runpod-jobrunner closeout-receipt/1",
+  "type": "object",
+  "required": [
+    "protocol",
+    "run_id",
+    "lifecycle",
+    "workload_result",
+    "approved_max_usd",
+    "resource",
+    "operations",
+    "recovery_reason",
+    "closeout",
+    "event_sequence"
+  ],
+  "properties": {
+    "protocol": {"const": "closeout-receipt/1"},
+    "run_id": {"$ref": "#/$defs/run-id"},
+    "lifecycle": {"const": "closed"},
+    "workload_result": {"enum": ["succeeded", "failed", "cancelled"]},
+    "approved_max_usd": {"$ref": "#/$defs/nonnegative-money"},
+    "resource": {
+      "type": ["object", "null"],
+      "required": ["id"],
+      "properties": {"id": {"type": "string", "minLength": 1}},
+      "additionalProperties": true
+    },
+    "operations": {
+      "type": "object",
+      "propertyNames": {"enum": ["provision", "start", "delete"]},
+      "additionalProperties": {"$ref": "#/$defs/operation"}
+    },
+    "recovery_reason": {"type": ["string", "null"]},
+    "closeout": {
+      "type": "object",
+      "required": [
+        "artifact_disposition",
+        "delete_acknowledged",
+        "delete_already_absent",
+        "provider_not_found",
+        "current_spend_usd_per_hour"
+      ],
+      "properties": {
+        "artifact_disposition": {"$ref": "#/$defs/artifact-disposition"},
+        "delete_acknowledged": {"const": true},
+        "delete_already_absent": {"type": "boolean"},
+        "provider_not_found": {"const": true},
+        "current_spend_usd_per_hour": {"const": "0"},
+        "delete_acknowledged_resource_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "provision_absence_confirmed": {"type": "boolean"},
+        "provision_absence_first_observed_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": true
+    },
+    "event_sequence": {"type": "integer", "minimum": 1},
+    "quarantined_resource_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "run-id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "nonnegative-money": {
+      "type": "string",
+      "pattern": "^(?:0|0\\.[0-9]+|[1-9][0-9]*(?:\\.[0-9]+)?)$"
+    },
+    "artifact-disposition": {
+      "type": "object",
+      "required": ["status", "detail"],
+      "properties": {
+        "status": {
+          "enum": ["verified", "partial_recovered", "unavailable", "not_applicable"]
+        },
+        "detail": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "type": "object",
+      "required": ["id", "status", "attempts"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^op-.+"},
+        "status": {"type": "string", "minLength": 1},
+        "attempts": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  }
+}

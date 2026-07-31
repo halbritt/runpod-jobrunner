@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runpod-jobrunner.local/schemas/run-request-1.json",
+  "title": "runpod-jobrunner run-request/1",
+  "type": "object",
+  "required": [
+    "protocol",
+    "run_id",
+    "bundle_hash",
+    "image_digest",
+    "phases",
+    "limits",
+    "heartbeat_interval_seconds",
+    "termination_grace_seconds",
+    "storage"
+  ],
+  "properties": {
+    "protocol": {"const": "run-request/1"},
+    "run_id": {"$ref": "#/$defs/run-id"},
+    "bundle_hash": {"$ref": "#/$defs/sha256"},
+    "image_digest": {
+      "type": "string",
+      "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$"
+    },
+    "runner_version": {"type": "string", "minLength": 1},
+    "runner_git_commit": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+    "phases": {
+      "type": "object",
+      "required": ["verify", "preflight", "train", "evaluate", "package"],
+      "properties": {
+        "verify": {"$ref": "#/$defs/phase"},
+        "preflight": {"$ref": "#/$defs/phase"},
+        "train": {"$ref": "#/$defs/phase"},
+        "evaluate": {"$ref": "#/$defs/phase"},
+        "package": {"$ref": "#/$defs/phase"}
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "required": ["max_elapsed_seconds", "max_cost_usd", "usd_per_hour"],
+      "properties": {
+        "max_elapsed_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_cost_usd": {"$ref": "#/$defs/positive-money"},
+        "usd_per_hour": {"$ref": "#/$defs/positive-money"}
+      },
+      "additionalProperties": true
+    },
+    "heartbeat_interval_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "termination_grace_seconds": {"type": "number", "minimum": 0},
+    "storage": {
+      "type": "object",
+      "required": ["encrypted", "mount", "required_gb"],
+      "properties": {
+        "encrypted": {"const": true},
+        "mount": {"type": "string", "pattern": "^/[^\\u0000]*$"},
+        "required_gb": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": true
+    },
+    "artifact_manifest_path": {"$ref": "#/$defs/safe-relative-path"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "run-id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "positive-money": {
+      "type": "string",
+      "pattern": "^(?:0\\.[0-9]*[1-9][0-9]*|[1-9][0-9]*(?:\\.[0-9]+)?)$"
+    },
+    "safe-relative-path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?=.+[^/])[^\\u0000]+$"
+    },
+    "phase": {
+      "type": "object",
+      "required": ["enabled", "argv", "timeout_seconds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "argv": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"}
+        },
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+          "then": {"properties": {"argv": {"minItems": 1}}}
+        }
+      ]
+    }
+  }
+}

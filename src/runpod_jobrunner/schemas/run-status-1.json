@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runpod-jobrunner.local/schemas/run-status-1.json",
+  "title": "runpod-jobrunner run-status/1",
+  "type": "object",
+  "required": ["protocol", "run_id"],
+  "properties": {
+    "protocol": {"const": "run-status/1"},
+    "run_id": {"$ref": "#/$defs/run-id"}
+  },
+  "anyOf": [
+    {"$ref": "#/$defs/remote-status"},
+    {"$ref": "#/$defs/lifecycle-status"}
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "run-id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "phase": {
+      "type": ["string", "null"],
+      "enum": ["verify", "preflight", "train", "evaluate", "package", null]
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegative-money": {
+      "type": "string",
+      "pattern": "^(?:0|0\\.[0-9]+|[1-9][0-9]*(?:\\.[0-9]+)?)$"
+    },
+    "child": {
+      "type": ["object", "null"],
+      "required": ["pid", "running", "exit_code"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "running": {"type": "boolean"},
+        "exit_code": {"type": ["integer", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "terminal-result": {
+      "type": "object",
+      "required": [
+        "outcome",
+        "reason",
+        "phase",
+        "elapsed_seconds",
+        "estimated_cost_usd",
+        "completed_phases",
+        "phase_exit_codes"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": ["succeeded", "failed", "stopped", "timed_out", "limit_exceeded"]
+        },
+        "reason": {
+          "enum": [
+            "all_enabled_phases_completed",
+            "phase_nonzero_exit",
+            "phase_start_failed",
+            "phase_timeout",
+            "termination_requested",
+            "controller_stop_requested",
+            "elapsed_cap",
+            "cost_cap",
+            "storage_unavailable",
+            "storage_capacity_below_request",
+            "runner_restart_unknown_child",
+            "artifact_manifest_missing",
+            "artifact_manifest_invalid",
+            "artifact_file_missing",
+            "artifact_size_mismatch",
+            "artifact_hash_mismatch"
+          ]
+        },
+        "phase": {"$ref": "#/$defs/phase"},
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "estimated_cost_usd": {"$ref": "#/$defs/nonnegative-money"},
+        "completed_phases": {
+          "type": "array",
+          "items": {
+            "enum": ["verify", "preflight", "train", "evaluate", "package"]
+          },
+          "uniqueItems": true
+        },
+        "phase_exit_codes": {
+          "type": "object",
+          "propertyNames": {
+            "enum": ["verify", "preflight", "train", "evaluate", "package"]
+          },
+          "additionalProperties": {"type": "integer"}
+        },
+        "artifact_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_manifest_size": {"type": "integer", "minimum": 0}
+      },
+      "dependentRequired": {
+        "artifact_manifest_sha256": ["artifact_manifest_size"],
+        "artifact_manifest_size": ["artifact_manifest_sha256"]
+      },
+      "additionalProperties": true
+    },
+    "remote-status": {
+      "type": "object",
+      "required": [
+        "state",
+        "phase",
+        "heartbeat_monotonic_seconds",
+        "child",
+        "latest_event_sequence",
+        "terminal_result"
+      ],
+      "properties": {
+        "state": {"enum": ["ready", "running", "terminal"]},
+        "phase": {"$ref": "#/$defs/phase"},
+        "heartbeat_sequence": {"type": "integer", "minimum": 0},
+        "heartbeat_at_unix": {"type": "number", "minimum": 0},
+        "heartbeat_age_seconds": {"type": "number", "minimum": 0},
+        "heartbeat_monotonic_seconds": {"type": "number", "minimum": 0},
+        "child": {"$ref": "#/$defs/child"},
+        "latest_event_sequence": {"type": "integer", "minimum": 0},
+        "terminal_result": {
+          "anyOf": [{"$ref": "#/$defs/terminal-result"}, {"type": "null"}]
+        }
+      },
+      "anyOf": [
+        {"required": ["heartbeat_at_unix"]},
+        {"required": ["heartbeat_age_seconds"]}
+      ],
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "terminal"}}, "required": ["state"]},
+          "then": {"properties": {"terminal_result": {"$ref": "#/$defs/terminal-result"}}},
+          "else": {"properties": {"terminal_result": {"type": "null"}}}
+        }
+      ]
+    },
+    "artifact-disposition": {
+      "type": "object",
+      "required": ["status", "detail"],
+      "properties": {
+        "status": {
+          "enum": ["verified", "partial_recovered", "unavailable", "not_applicable"]
+        },
+        "detail": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "closeout": {
+      "type": "object",
+      "required": [
+        "artifact_disposition",
+        "delete_acknowledged",
+        "delete_already_absent",
+        "provider_not_found",
+        "current_spend_usd_per_hour"
+      ],
+      "properties": {
+        "artifact_disposition": {
+          "anyOf": [{"$ref": "#/$defs/artifact-disposition"}, {"type": "null"}]
+        },
+        "delete_acknowledged": {"type": "boolean"},
+        "delete_already_absent": {"type": "boolean"},
+        "provider_not_found": {"type": "boolean"},
+        "current_spend_usd_per_hour": {
+          "anyOf": [{"$ref": "#/$defs/nonnegative-money"}, {"type": "null"}]
+        },
+        "delete_acknowledged_resource_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "provision_absence_confirmed": {"type": "boolean"},
+        "provision_absence_first_observed_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "type": "object",
+      "required": ["id", "status", "attempts"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^op-.+"},
+        "status": {"type": "string", "minLength": 1},
+        "attempts": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "resource": {
+      "type": ["object", "null"],
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "run_id": {"$ref": "#/$defs/run-id"},
+        "create_operation_id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "state": {"enum": ["provisioned", "starting", "running", "stopped"]},
+        "hourly_rate_usd": {"$ref": "#/$defs/nonnegative-money"}
+      },
+      "additionalProperties": true
+    },
+    "lifecycle-status": {
+      "type": "object",
+      "required": [
+        "lifecycle",
+        "workload_result",
+        "approved_max_usd",
+        "resource",
+        "operations",
+        "recovery_reason",
+        "closeout"
+      ],
+      "properties": {
+        "lifecycle": {
+          "enum": [
+            "planned",
+            "provisioning",
+            "starting",
+            "running",
+            "recovering",
+            "deleting",
+            "closed"
+          ]
+        },
+        "workload_result": {
+          "type": ["string", "null"],
+          "enum": ["succeeded", "failed", "cancelled", null]
+        },
+        "approved_max_usd": {"$ref": "#/$defs/nonnegative-money"},
+        "resource": {"$ref": "#/$defs/resource"},
+        "operations": {
+          "type": "object",
+          "propertyNames": {"enum": ["provision", "start", "delete"]},
+          "additionalProperties": {"$ref": "#/$defs/operation"}
+        },
+        "recovery_reason": {"type": ["string", "null"]},
+        "closeout": {"$ref": "#/$defs/closeout"},
+        "event_sequence": {"type": "integer", "minimum": 1},
+        "quarantined_resource_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"lifecycle": {"const": "closed"}},
+            "required": ["lifecycle"]
+          },
+          "then": {
+            "properties": {
+              "workload_result": {"enum": ["succeeded", "failed", "cancelled"]},
+              "closeout": {
+                "properties": {
+                  "artifact_disposition": {"$ref": "#/$defs/artifact-disposition"},
+                  "delete_acknowledged": {"const": true},
+                  "provider_not_found": {"const": true},
+                  "current_spend_usd_per_hour": {"const": "0"}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
