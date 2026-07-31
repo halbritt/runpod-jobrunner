@@ -55,6 +55,23 @@ class RecordingOpener:
         return Response(b"" if reply is None else json.dumps(reply).encode())
 
 
+def exception_object_graph_text(error: BaseException) -> str:
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    parts: list[str] = []
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        parts.extend((repr(item.args), repr(vars(item))))
+        if item.__cause__ is not None:
+            pending.append(item.__cause__)
+        if item.__context__ is not None:
+            pending.append(item.__context__)
+    return "\n".join(parts)
+
+
 def create_request() -> PodCreateRequest:
     return PodCreateRequest(
         name="rj-run-01-create-01",
@@ -234,6 +251,88 @@ def test_create_maps_http_500_to_unknown_without_leaking_api_key() -> None:
 
 def test_create_classifies_http_400_validation_without_leaking_remote_message() -> None:
     class FailingOpener:
+        def __init__(self) -> None:
+            self.body = io.BytesIO()
+
+        def open(self, request: Any, timeout: float) -> Response:
+            del timeout
+            self.body = io.BytesIO(
+                json.dumps(
+                    {
+                        "errors": [
+                            {
+                                "message": f"rejected {request.full_url}",
+                                "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+                            }
+                        ]
+                    }
+                ).encode()
+            )
+            raise HTTPError(
+                request.full_url, 400, "bad request", Message(), self.body
+            )
+
+    opener = FailingOpener()
+    api = RunPodHTTP("very-secret", opener=opener)
+
+    with pytest.raises(
+        RunPodTransportOutcomeUnknown, match="GraphQL validation failed"
+    ) as caught:
+        api.create_encrypted_pod(create_request(), volume_key="z" * 30)
+
+    assert opener.body.closed
+    assert "very-secret" not in exception_object_graph_text(caught.value)
+    assert caught.value.__cause__ is not None
+    assert caught.value.__cause__.__context__ is None
+
+
+def test_create_contains_deep_http_error_json_and_closes_body() -> None:
+    class FailingOpener:
+        def __init__(self) -> None:
+            self.body = io.BytesIO()
+
+        def open(self, request: Any, timeout: float) -> Response:
+            del timeout
+            self.body = io.BytesIO(("[" * 20000 + "0" + "]" * 20000).encode())
+            raise HTTPError(request.full_url, 400, "bad request", Message(), self.body)
+
+    opener = FailingOpener()
+    api = RunPodHTTP("very-secret", opener=opener)
+
+    with pytest.raises(RunPodTransportOutcomeUnknown, match="HTTP error 400") as caught:
+        api.create_encrypted_pod(create_request(), volume_key="z" * 30)
+
+    assert opener.body.closed
+    assert "very-secret" not in exception_object_graph_text(caught.value)
+
+
+def test_get_404_closes_http_error_body() -> None:
+    class MissingOpener:
+        def __init__(self) -> None:
+            self.body = io.BytesIO(
+                json.dumps(
+                    {
+                        "errors": [
+                            {
+                                "message": "not found",
+                            }
+                        ]
+                    }
+                ).encode()
+            )
+
+        def open(self, request: Any, timeout: float) -> Response:
+            del timeout
+            raise HTTPError(request.full_url, 404, "not found", Message(), self.body)
+
+    opener = MissingOpener()
+
+    assert RunPodHTTP("secret", opener=opener).get_pod("gone") is None
+    assert opener.body.closed
+
+
+def test_create_ignores_unrecognized_http_error_details() -> None:
+    class FailingOpener:
         def open(self, request: Any, timeout: float) -> Response:
             del timeout
             body = json.dumps(
@@ -241,7 +340,7 @@ def test_create_classifies_http_400_validation_without_leaking_remote_message() 
                     "errors": [
                         {
                             "message": f"rejected {request.full_url}",
-                            "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+                            "extensions": {"code": "UNRECOGNIZED"},
                         }
                     ]
                 }
@@ -250,9 +349,7 @@ def test_create_classifies_http_400_validation_without_leaking_remote_message() 
 
     api = RunPodHTTP("very-secret", opener=FailingOpener())
 
-    with pytest.raises(
-        RunPodTransportOutcomeUnknown, match="GraphQL validation failed"
-    ) as caught:
+    with pytest.raises(RunPodTransportOutcomeUnknown, match="HTTP error 400") as caught:
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
     assert "very-secret" not in str(caught.value)

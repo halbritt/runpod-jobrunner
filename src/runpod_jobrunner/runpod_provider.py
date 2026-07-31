@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -249,23 +250,31 @@ class RunPodHTTP:
         request.add_header("Accept", "application/json")
         if body is not None:
             request.add_header("Content-Type", "application/json")
+        http_error_code: int | None = None
+        http_error_suffix = ""
+        not_found = False
+        raw = b""
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 raw = response.read()
         except HTTPError as error:
-            if allow_not_found and error.code == 404:
-                return None
-            suffix = ""
-            if not include_authorization_header:
-                try:
-                    error_body = error.read(65537)
-                except (AttributeError, OSError):
-                    error_body = b""
-                suffix = _graphql_http_error_suffix(error_body)
-            raise ProviderProtocolError(f"RunPod HTTP error {error.code}{suffix}") from None
+            http_error_code = error.code
+            not_found = allow_not_found and error.code == 404
+            try:
+                if not not_found and not include_authorization_header:
+                    http_error_suffix = _read_graphql_http_error_suffix(error)
+            finally:
+                with suppress(Exception):
+                    error.close()
         except (URLError, TimeoutError, OSError) as error:
             raise RunPodTransportOutcomeUnknown(
                 f"RunPod transport outcome unknown ({type(error).__name__})"
+            ) from None
+        if not_found:
+            return None
+        if http_error_code is not None:
+            raise ProviderProtocolError(
+                f"RunPod HTTP error {http_error_code}{http_error_suffix}"
             ) from None
         if not raw:
             return {}
@@ -275,12 +284,20 @@ class RunPodHTTP:
             raise ProviderProtocolError("RunPod returned invalid JSON") from None
 
 
+def _read_graphql_http_error_suffix(error: HTTPError) -> str:
+    try:
+        raw = error.read(65537)
+    except Exception:
+        return ""
+    return _graphql_http_error_suffix(raw)
+
+
 def _graphql_http_error_suffix(raw: bytes) -> str:
     if not raw or len(raw) > 65536:
         return ""
     try:
         value: object = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         return ""
     if not isinstance(value, Mapping):
         return ""
