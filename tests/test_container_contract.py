@@ -139,6 +139,8 @@ def test_publish_workflow_and_script_never_use_floating_action_or_image_tags() -
     action_refs = re.findall(r"uses:\s*[^@\s]+@([^\s]+)", workflow)
     assert action_refs
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+    assert "docker buildx create" in workflow
+    assert "--driver docker-container" in workflow
     assert ":latest" not in workflow
     assert ":latest" not in publish_script
     assert "docker buildx build" in publish_script
