@@ -8,14 +8,19 @@ from email.message import Message
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from runpod_jobrunner import __version__
 from runpod_jobrunner.provider import (
     ProviderCreateRequest,
     ProviderOutcomeUnknown,
     ProviderRejected,
     ProviderResourceState,
+)
+from runpod_jobrunner.provider import (
+    ProviderProtocolError as LifecycleProviderProtocolError,
 )
 from runpod_jobrunner.runpod_provider import (
     PodCreateRequest,
@@ -92,8 +97,12 @@ def test_create_uses_encryption_key_and_provider_termination() -> None:
     assert values["volumeKey"] == "a1" * 15
     assert values["terminateAfter"] == "2026-08-01T00:00:00Z"
     assert values["cloudType"] == "SECURE"
-    assert opener.requests[0].get_header("Authorization") == "Bearer secret"
-    assert "secret" not in opener.requests[0].full_url
+    assert opener.requests[0].get_header("Authorization") is None
+    assert opener.requests[0].get_header("User-agent") == f"runpod-jobrunner/{__version__}"
+    assert parse_qs(urlsplit(str(opener.requests[0].full_url)).query) == {
+        "api_key": ["secret"]
+    }
+    assert b"secret" not in opener.requests[0].data
 
 
 @pytest.mark.parametrize("key", ["", "x" * 31, "not-a-key"])
@@ -135,14 +144,51 @@ def test_unencrypted_create_is_deleted_before_returning_error() -> None:
 
 def test_graphql_create_errors_are_unknown_and_do_not_leak_key() -> None:
     opener = RecordingOpener(
-        [{"errors": [{"message": "no capacity"}], "data": {"podFindAndDeployOnDemand": None}}]
+        [
+            {
+                "errors": [
+                    {
+                        "message": (
+                            "request failed at "
+                            "https://api.runpod.io/graphql?api_key=very-secret"
+                        )
+                    }
+                ],
+                "data": {"podFindAndDeployOnDemand": None},
+            }
+        ]
     )
     api = RunPodHTTP("very-secret", opener=opener)
 
-    with pytest.raises(RunPodTransportOutcomeUnknown, match="no capacity") as caught:
+    with pytest.raises(RunPodTransportOutcomeUnknown) as caught:
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
     assert "very-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("errors", [{"message": "failed"}, "failed", 1, True])
+def test_graphql_rejects_malformed_errors_field(errors: object) -> None:
+    api = RunPodHTTP(
+        "secret",
+        opener=RecordingOpener(
+            [{"errors": errors, "data": {"myself": {"currentSpendPerHr": 0}}}]
+        ),
+    )
+
+    with pytest.raises(ProviderProtocolError, match="errors field"):
+        api.current_spend_per_hour()
+
+
+@pytest.mark.parametrize("errors", [None, []])
+def test_graphql_accepts_null_or_empty_errors_field(errors: object) -> None:
+    api = RunPodHTTP(
+        "secret",
+        opener=RecordingOpener(
+            [{"errors": errors, "data": {"myself": {"currentSpendPerHr": 0}}}]
+        ),
+    )
+
+    assert api.current_spend_per_hour() == 0
 
 
 @pytest.mark.parametrize(
@@ -170,16 +216,18 @@ def test_create_maps_ambiguous_protocol_responses_to_unknown(raw: bytes) -> None
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
 
-def test_create_maps_http_500_to_unknown() -> None:
+def test_create_maps_http_500_to_unknown_without_leaking_api_key() -> None:
     class FailingOpener:
         def open(self, request: Any, timeout: float) -> Response:
             del timeout
             raise HTTPError(request.full_url, 500, "server error", Message(), None)
 
-    api = RunPodHTTP("secret", opener=FailingOpener())
+    api = RunPodHTTP("very-secret", opener=FailingOpener())
 
-    with pytest.raises(RunPodTransportOutcomeUnknown):
+    with pytest.raises(RunPodTransportOutcomeUnknown) as caught:
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
+
+    assert "very-secret" not in str(caught.value)
 
 
 def test_exact_name_reconciliation_and_spend() -> None:
@@ -198,6 +246,23 @@ def test_exact_name_reconciliation_and_spend() -> None:
 
     assert [pod.id for pod in matches] == ["one"]
     assert str(api.current_spend_per_hour()) == "0.24"
+    assert opener.requests[0].get_header("Authorization") == "Bearer secret"
+    assert "secret" not in opener.requests[0].full_url
+    assert opener.requests[1].get_header("Authorization") is None
+    assert parse_qs(urlsplit(str(opener.requests[1].full_url)).query) == {
+        "api_key": ["secret"]
+    }
+
+
+@pytest.mark.parametrize("value", [None, "not-money", "NaN", "Infinity", "-0.01"])
+def test_current_spend_rejects_malformed_nonfinite_or_negative_values(value: object) -> None:
+    api = RunPodHTTP(
+        "secret",
+        opener=RecordingOpener([{"data": {"myself": {"currentSpendPerHr": value}}}]),
+    )
+
+    with pytest.raises(ProviderProtocolError, match="spend"):
+        api.current_spend_per_hour()
 
 
 @pytest.mark.parametrize("malformed_item", [None, "pod-1", 7, []])
@@ -272,6 +337,18 @@ def provider_request() -> ProviderCreateRequest:
             "max_hourly_rate_usd": "0.24",
         },
     )
+
+
+@pytest.mark.parametrize("spend", [Decimal("NaN"), Decimal("Infinity"), Decimal("-0.01")])
+def test_production_adapter_rejects_invalid_current_spend(
+    tmp_path: Path, spend: Decimal
+) -> None:
+    api = FakeAPI()
+    api.spend = spend
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    with pytest.raises(LifecycleProviderProtocolError, match="spend"):
+        provider.current_spend_usd_per_hour(None)
 
 
 def test_production_adapter_creates_encrypted_resource_with_durable_key(tmp_path: Path) -> None:

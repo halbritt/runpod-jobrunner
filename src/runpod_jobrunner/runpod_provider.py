@@ -17,8 +17,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NoReturn, Protocol, cast
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, build_opener
 
+from runpod_jobrunner import __version__
 from runpod_jobrunner.provider import (
     DeleteReceipt,
     ProviderCreateRequest,
@@ -198,23 +200,33 @@ class RunPodHTTP:
         if not isinstance(myself, Mapping) or "currentSpendPerHr" not in myself:
             raise ProviderProtocolError("RunPod spend response was malformed")
         myself_record = cast(Mapping[str, object], myself)
-        return Decimal(str(myself_record["currentSpendPerHr"]))
+        try:
+            spend = Decimal(str(myself_record["currentSpendPerHr"]))
+        except (InvalidOperation, ValueError):
+            raise ProviderProtocolError("RunPod spend response was malformed") from None
+        if not spend.is_finite() or spend < 0:
+            raise ProviderProtocolError("RunPod spend response was malformed")
+        return spend
 
     def _graphql(self, query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
+        url = f"{GRAPHQL_URL}?{urlencode({'api_key': self._api_key})}"
         raw = self._json_request(
-            "POST", GRAPHQL_URL, payload={"query": query, "variables": variables}
+            "POST",
+            url,
+            payload={"query": query, "variables": variables},
+            include_authorization_header=False,
         )
         if not isinstance(raw, Mapping):
             raise ProviderProtocolError("RunPod GraphQL response was not an object")
         response = cast(Mapping[str, object], raw)
         errors = response.get("errors")
-        if isinstance(errors, Sequence) and errors:
-            first = cast(Sequence[object], errors)[0]
-            if isinstance(first, Mapping):
-                message = cast(Mapping[str, object], first).get("message", "unknown error")
-            else:
-                message = "unknown error"
-            raise ProviderProtocolError(f"RunPod GraphQL error: {message}")
+        if errors is not None:
+            if not isinstance(errors, Sequence) or isinstance(
+                errors, (str, bytes, bytearray)
+            ):
+                raise ProviderProtocolError("RunPod GraphQL errors field was malformed")
+            if errors:
+                raise ProviderProtocolError("RunPod GraphQL request failed")
         data = response.get("data")
         if not isinstance(data, Mapping):
             raise ProviderProtocolError("RunPod GraphQL response had no data")
@@ -227,10 +239,13 @@ class RunPodHTTP:
         *,
         payload: Mapping[str, object] | None = None,
         allow_not_found: bool = False,
+        include_authorization_header: bool = True,
     ) -> Any:
         body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
         request = Request(url, data=body, method=method)
-        request.add_header("Authorization", f"Bearer {self._api_key}")
+        request.add_header("User-Agent", f"runpod-jobrunner/{__version__}")
+        if include_authorization_header:
+            request.add_header("Authorization", f"Bearer {self._api_key}")
         request.add_header("Accept", "application/json")
         if body is not None:
             request.add_header("Content-Type", "application/json")
@@ -477,9 +492,12 @@ class RunPodProvider:
     def current_spend_usd_per_hour(self, resource_id: str | None) -> Decimal:
         del resource_id
         try:
-            return self._api.current_spend_per_hour()
+            spend = self._api.current_spend_per_hour()
         except ProviderProtocolError as error:
             raise InternalProviderProtocolError(str(error)) from error
+        if not spend.is_finite() or spend < 0:
+            raise InternalProviderProtocolError("RunPod current spend was invalid")
+        return spend
 
     def _volume_key(self, operation_id: str) -> str:
         directory = self._secrets_root / operation_id
