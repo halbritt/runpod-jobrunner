@@ -13,7 +13,7 @@ import re
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NoReturn, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -49,7 +49,7 @@ class SecurityInvariantError(RuntimeError):
 
 
 class RunPodTransportOutcomeUnknown(ProviderProtocolError):
-    """A mutating HTTP request failed after its outcome became unknowable."""
+    """A mutating HTTP request returned without proving whether its effect happened."""
 
 
 class _Opener(Protocol):
@@ -135,11 +135,18 @@ class RunPodHTTP:
             }
           }
         """
-        result = self._graphql(query, variables)
-        raw = result.get("podFindAndDeployOnDemand")
-        if not isinstance(raw, Mapping):
-            raise ProviderProtocolError("RunPod create returned no pod")
-        pod = _parse_pod(cast(Mapping[str, Any], raw))
+        try:
+            result = self._graphql(query, variables)
+            raw = result.get("podFindAndDeployOnDemand")
+            if not isinstance(raw, Mapping):
+                raise ProviderProtocolError("RunPod create returned no pod")
+            pod = _parse_pod(cast(Mapping[str, Any], raw))
+        except RunPodTransportOutcomeUnknown:
+            raise
+        except ProviderProtocolError as error:
+            raise RunPodTransportOutcomeUnknown(
+                f"RunPod create outcome unknown: {error}"
+            ) from error
         if pod.volume_encrypted is not True:
             cleanup_error: str | None = None
             try:
@@ -251,13 +258,19 @@ def _parse_pod(raw: Mapping[str, Any]) -> PodObservation:
     if not isinstance(pod_id, str) or not isinstance(name, str):
         raise ProviderProtocolError("RunPod pod record lacks string id/name")
     cost = raw.get("costPerHr")
+    try:
+        parsed_cost = None if cost is None else Decimal(str(cost))
+    except (InvalidOperation, ValueError):
+        raise ProviderProtocolError("RunPod pod record has an invalid hourly rate") from None
+    if parsed_cost is not None and (not parsed_cost.is_finite() or parsed_cost < 0):
+        raise ProviderProtocolError("RunPod pod record has an invalid hourly rate")
     mappings = raw.get("portMappings")
     environment = _parse_environment(raw.get("env"))
     return PodObservation(
         id=pod_id,
         name=name,
         desired_status=_optional_string(raw.get("desiredStatus")),
-        cost_per_hour=None if cost is None else Decimal(str(cost)),
+        cost_per_hour=parsed_cost,
         volume_encrypted=(
             raw.get("volumeEncrypted") if isinstance(raw.get("volumeEncrypted"), bool) else None
         ),
@@ -385,7 +398,7 @@ class RunPodProvider:
         except SecurityInvariantError as error:
             raise ProviderRejected(str(error), resource_id=error.resource_id) from error
         except ProviderProtocolError as error:
-            raise InternalProviderProtocolError(str(error)) from error
+            raise ProviderOutcomeUnknown("provision", request.operation_id) from error
         if pod.cost_per_hour is None:
             self._delete_rejected_pod(pod.id, "RunPod pod has no hourly rate")
         assert pod.cost_per_hour is not None

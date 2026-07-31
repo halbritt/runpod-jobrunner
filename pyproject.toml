@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "runpod-jobrunner"
-version = "0.1.0"
+version = "0.1.1"
 description = "Recoverable, bounded RunPod jobs with a fixed execution protocol"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,10 @@ dev = [
   "pyright>=1.1.400",
   "ruff>=0.15,<0.16",
 ]
+
+[dependency-groups]
+build = ["setuptools==80.9.0"]
+ci-tools = ["uv==0.11.25"]
 
 [project.scripts]
 runpod-jobrunner = "runpod_jobrunner.cli:main"

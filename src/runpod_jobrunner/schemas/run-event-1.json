@@ -32,6 +32,7 @@
           "enum": [
             "ready",
             "runner_resumed",
+            "launch_authorized",
             "phase_started",
             "phase_completed",
             "phase_failed",

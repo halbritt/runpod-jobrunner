@@ -14,6 +14,16 @@ def write_status(status_dir: Path) -> None:
     status = {
         "protocol": "run-status/1",
         "run_id": "run-http-001",
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "future-safe-protocol": [2],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
         "state": "running",
         "phase": "train",
         "heartbeat_at_unix": time.time() - 0.05,
@@ -61,6 +71,16 @@ def test_authenticated_status_is_read_only_and_redacts_internal_fields(tmp_path:
     assert exposed == {
         "protocol": "run-status/1",
         "run_id": "run-http-001",
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "future-safe-protocol": [2],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
         "state": "running",
         "phase": "train",
         "heartbeat_age_seconds": exposed["heartbeat_age_seconds"],

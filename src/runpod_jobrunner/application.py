@@ -10,6 +10,7 @@ import os
 import secrets
 import shutil
 import sys
+import threading
 import time
 import tomllib
 import uuid
@@ -22,6 +23,18 @@ from typing import Any, NoReturn, Protocol, cast
 
 from runpod_jobrunner.budget import BudgetLedger
 from runpod_jobrunner.bundle import JobBundle, check_bundle
+from runpod_jobrunner.identity import RunnerIdentity, RunnerIdentityError, parse_protocol_majors
+from runpod_jobrunner.incremental_ack import (
+    ACK_PROTOCOL,
+    IncrementalAckError,
+    ensure_ack_signer,
+)
+from runpod_jobrunner.launch_authorization import (
+    LaunchAuthorizationError,
+    ensure_launch_token,
+    parse_launch_authorization,
+    read_launch_token,
+)
 from runpod_jobrunner.lifecycle import (
     ArtifactDisposition,
     LifecycleController,
@@ -117,9 +130,17 @@ class JobRunner:
                     run_id,
                     bundle.max_cost_usd,
                 )
+            run_dir = self.store.paths(run_id).directory
+            token, token_hash = _ensure_status_token(run_dir)
             remote = bundle.to_run_request(run_id)
-            token, token_hash = _ensure_status_token(self.store.paths(run_id).directory)
-            del token
+            remote = _add_incremental_ack(bundle, remote, run_dir)
+            try:
+                launch_token = ensure_launch_token(run_dir, forbidden_tokens=(token,))
+                remote["launch_authorization"] = launch_token.request_fields(
+                    timeout_seconds=min(bundle.max_elapsed_seconds, 600)
+                )
+            except LaunchAuthorizationError as error:
+                raise ApplicationError(str(error)) from error
             request = _durable_request(bundle, remote, approved, token_hash, self._now())
             controller = LifecycleController(self.store, _PlanningProvider())
             controller.plan(run_id, request, approved_max_usd=format(approved, "f"))
@@ -259,6 +280,7 @@ def _recovery_must_not_dispatch_workload(state: Mapping[str, object]) -> bool:
     if state.get("recovery_reason") in {
         "resource_disappeared_before_start",
         "duplicate_provider_resources",
+        "provision_dispatch_unresolved",
     }:
         return True
     quarantined = state.get("quarantined_resource_ids")
@@ -267,8 +289,43 @@ def _recovery_must_not_dispatch_workload(state: Mapping[str, object]) -> bool:
     return bool(cast(list[object], quarantined))
 
 
+def _local_ready_identity_error(
+    status: Mapping[str, object], request: Mapping[str, object]
+) -> str | None:
+    """Independently validate the ready runner before publishing private input."""
+
+    if status.get("protocol") != "run-status/1" or status.get("run_id") != request.get(
+        "run_id"
+    ):
+        return "status protocol or run id differs from the request"
+    if status.get("runner_version") != request.get("runner_version"):
+        return "runner version differs from the request"
+    if status.get("runner_git_commit") != request.get("runner_git_commit"):
+        return "runner Git commit differs from the request"
+    try:
+        runner_majors = parse_protocol_majors(status.get("supported_protocol_majors"))
+        controller_majors = parse_protocol_majors(request.get("supported_protocol_majors"))
+    except RunnerIdentityError as error:
+        return str(error)
+    for protocol in (
+        "artifact-manifest",
+        "launch-authorization",
+        "run-event",
+        "run-request",
+        "run-status",
+    ):
+        if 1 not in runner_majors.get(protocol, ()) or 1 not in controller_majors.get(
+            protocol, ()
+        ):
+            return f"protocol major differs for {protocol}"
+    return None
+
+
 class LocalRunnerExecutor:
     """Run the real remote-runner process model against local filesystem adapters."""
+
+    def __init__(self, *, runner_identity: RunnerIdentity | None = None) -> None:
+        self._runner_identity = runner_identity
 
     def execute(self, request: Mapping[str, object], run_dir: Path) -> ExecutionObservation:
         remote = copy.deepcopy(_mapping(request.get("remote"), "request.remote"))
@@ -281,18 +338,59 @@ class LocalRunnerExecutor:
         remote_storage["mount"] = str(local_storage)
         remote_storage["required_gb"] = 1
         remote["storage"] = remote_storage
-        input_root = Path(_string(controller, "input_root"))
-        input_manifest = _sequence(controller.get("input_files"), "input_files")
+        request_path = remote_root / "request.json"
+        _atomic_json(request_path, remote)
+        runner = RemoteRunner(
+            remote,
+            remote_root,
+            request_path=request_path,
+            runner_identity=self._runner_identity,
+            status_token_sha256=_string(controller, "status_token_sha256"),
+        )
+        terminal_holder: list[dict[str, object]] = []
+        runner_errors: list[Exception] = []
+
+        def run_remote() -> None:
+            try:
+                terminal_holder.append(runner.run())
+            except Exception as error:  # pragma: no cover - defensive thread boundary
+                runner_errors.append(error)
+
+        thread = threading.Thread(target=run_remote, name=f"runner-{remote['run_id']}")
+        thread.start()
+        published = False
         try:
-            LocalTransfer().upload(
-                input_root,
-                remote_root / "input",
-                [cast(Mapping[str, object], item) for item in input_manifest],
-            )
-        except TransferError as error:
-            raise ApplicationError(str(error)) from error
-        _atomic_json(remote_root / "request.json", remote)
-        terminal = RemoteRunner(remote, remote_root).run()
+            while thread.is_alive():
+                if runner.status_path.is_file():
+                    status = _read_json_mapping(runner.status_path)
+                    state = status.get("state")
+                    if state == "ready":
+                        identity_error = _local_ready_identity_error(status, remote)
+                        if identity_error is not None:
+                            runner.request_stop("controller_stop_requested")
+                            break
+                        if not published:
+                            self._publish_local_inputs_and_launch(
+                                controller,
+                                remote,
+                                run_dir,
+                                local_storage,
+                            )
+                            published = True
+                        break
+                    if state in {"running", "terminal"}:
+                        break
+                thread.join(timeout=0.01)
+            thread.join()
+        except (ApplicationError, LaunchAuthorizationError, TransferError):
+            runner.request_stop("controller_stop_requested")
+            thread.join()
+            raise
+        if runner_errors:
+            raise ApplicationError(f"local remote runner failed: {runner_errors[0]}")
+        if not terminal_holder:
+            raise ApplicationError("local remote runner produced no terminal result")
+        terminal = terminal_holder[0]
         outcome = terminal.get("outcome")
         result = WorkloadResult.SUCCEEDED if outcome == "succeeded" else WorkloadResult.FAILED
         disposition = self._recover_artifacts(controller, local_storage, run_dir, result, terminal)
@@ -300,6 +398,38 @@ class LocalRunnerExecutor:
             result=result,
             disposition=disposition,
             detail=f"remote outcome: {outcome}",
+        )
+
+    @staticmethod
+    def _publish_local_inputs_and_launch(
+        controller: Mapping[str, object],
+        remote: Mapping[str, object],
+        run_dir: Path,
+        storage_root: Path,
+    ) -> None:
+        run_id = _string(remote, "run_id")
+        remote_run_root = storage_root / "runpod-jobrunner" / "runs" / run_id
+        input_root = Path(_string(controller, "input_root"))
+        input_manifest = [
+            cast(Mapping[str, object], item)
+            for item in _sequence(controller.get("input_files"), "input_files")
+        ]
+        transfer = LocalTransfer()
+        transfer.upload(input_root, remote_run_root / "input", input_manifest)
+        authorization = parse_launch_authorization(remote.get("launch_authorization"))
+        token_path = run_dir / "secrets" / "launch-authorization.token"
+        token = read_launch_token(token_path)
+        encoded = token_path.read_bytes()
+        if (
+            len(encoded) != authorization.size
+            or hashlib.sha256(token.encode("ascii")).hexdigest() != authorization.sha256
+        ):
+            raise ApplicationError("local launch token differs from the pinned run request")
+        transfer.publish_atomic(
+            token_path,
+            remote_run_root.joinpath(*authorization.relative_path.parts),
+            size=authorization.size,
+            sha256=hashlib.sha256(encoded).hexdigest(),
         )
 
     def _recover_artifacts(
@@ -408,8 +538,42 @@ def _durable_request(
             "artifact_manifest_path": artifacts.get("manifest_path"),
             "status_token_sha256": status_token_hash,
             "remote_run_root": remote_run_root,
+            **(
+                {"incremental_manifest_glob": artifacts["incremental_manifest_glob"]}
+                if artifacts.get("incremental_manifest_glob") is not None
+                else {}
+            ),
+            **(
+                {"incremental_mirror_ack": remote["incremental_mirror_ack"]}
+                if remote.get("incremental_mirror_ack") is not None
+                else {}
+            ),
         },
     }
+
+
+def _add_incremental_ack(
+    bundle: JobBundle,
+    remote: Mapping[str, object],
+    run_dir: Path,
+) -> dict[str, object]:
+    request = dict(remote)
+    artifacts = _mapping(bundle.job_spec.get("artifacts"), "artifacts")
+    raw_ack = artifacts.get("incremental_mirror_ack")
+    if raw_ack is None:
+        return request
+    ack = _mapping(raw_ack, "artifacts.incremental_mirror_ack")
+    try:
+        signer = ensure_ack_signer(run_dir, _string(remote, "run_id"))
+    except IncrementalAckError as error:
+        raise ApplicationError(str(error)) from error
+    request["incremental_mirror_ack"] = {
+        "protocol": ACK_PROTOCOL,
+        "directory": ack.get("directory"),
+        "timeout_seconds": ack.get("timeout_seconds"),
+        "signer": signer.public_fields(),
+    }
+    return request
 
 
 def _bundle_summary(bundle: JobBundle) -> dict[str, object]:
@@ -417,6 +581,8 @@ def _bundle_summary(bundle: JobBundle) -> dict[str, object]:
         "name": bundle.name,
         "bundle_hash": bundle.bundle_hash,
         "image": bundle.image_digest,
+        "runner_version": bundle.runner_version,
+        "runner_git_commit": bundle.runner_git_commit,
         "input_files": len(bundle.inputs),
         "input_bytes": sum(item.size for item in bundle.inputs),
         "max_cost_usd": format(bundle.max_cost_usd, "f"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,6 +26,25 @@ def make_controller(tmp_path: Path) -> tuple[LifecycleController, RunStore, Memo
     store = RunStore(tmp_path / "runs")
     provider = MemoryRunPod()
     return LifecycleController(store, provider), store, provider
+
+
+class DelayedVisibilityRunPod(MemoryRunPod):
+    def __init__(self, *, hidden_observations_after_create: int) -> None:
+        super().__init__()
+        self.hidden_observations_after_create = hidden_observations_after_create
+        self.create_completed = False
+
+    def find_resources(self, create_operation_id: str):  # type: ignore[no-untyped-def]
+        if self.create_completed and self.hidden_observations_after_create > 0:
+            self.hidden_observations_after_create -= 1
+            return ()
+        return super().find_resources(create_operation_id)
+
+    def create(self, request: ProviderCreateRequest):  # type: ignore[no-untyped-def]
+        try:
+            return super().create(request)
+        finally:
+            self.create_completed = True
 
 
 def reach_running(controller: LifecycleController, run_id: str = "run-1") -> dict[str, object]:
@@ -74,9 +94,33 @@ def test_provision_and_start_intents_are_durable_before_provider_effects(tmp_pat
     assert running["lifecycle"] == LifecycleState.RUNNING
     assert [effect.kind for effect in provider.effects] == ["provision", "start"]
     assert observed == [
-        ("provision", "provider_operation_intended"),
+        ("provision", "provider_operation_dispatched"),
         ("start", "resource_provisioned"),
     ]
+
+
+def test_unknown_create_waits_for_delayed_exact_resource_visibility(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    provider = DelayedVisibilityRunPod(hidden_observations_after_create=3)
+    controller = LifecycleController(store, provider)
+    controller.plan("run-1", {"job": "noop"}, approved_max_usd="1")
+    controller.reconcile("run-1")
+    provider.fail_next_after_effect("provision")
+
+    with pytest.raises(ProviderOutcomeUnknown):
+        controller.reconcile("run-1")
+
+    for _ in range(3):
+        pending = controller.reconcile("run-1")
+        assert pending["lifecycle"] == LifecycleState.PROVISIONING
+        assert pending["operations"]["provision"]["attempts"] == 1
+        assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+    adopted = controller.reconcile("run-1")
+
+    assert adopted["lifecycle"] == LifecycleState.STARTING
+    assert adopted["resource"]["id"] == "memory-pod-000001"
+    assert [effect.kind for effect in provider.effects].count("provision") == 1
 
 
 def test_unknown_create_is_reconciled_without_a_duplicate(tmp_path: Path) -> None:
@@ -128,6 +172,94 @@ def test_process_crash_after_create_is_reconciled_without_a_duplicate(
     assert reconciled["lifecycle"] == LifecycleState.STARTING
     assert len(provider.resources) == 1
     assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+
+def test_process_crash_after_create_does_not_redispatch_during_visibility_lag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = RunStore(tmp_path / "runs")
+    provider = DelayedVisibilityRunPod(hidden_observations_after_create=2)
+    controller = LifecycleController(store, provider)
+    controller.plan("run-1", {"job": "noop"}, approved_max_usd="1")
+    controller.reconcile("run-1")
+    original_commit = RunTransaction.commit_state
+    crash_once = True
+
+    def crash_before_observation_is_journaled(
+        transaction: RunTransaction,
+        kind: str,
+        state: dict[str, object],
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        nonlocal crash_once
+        if crash_once and kind == "resource_provisioned":
+            crash_once = False
+            raise SystemExit("simulated controller death")
+        return original_commit(transaction, kind, state, payload)
+
+    monkeypatch.setattr(RunTransaction, "commit_state", crash_before_observation_is_journaled)
+
+    with pytest.raises(SystemExit, match="controller death"):
+        controller.reconcile("run-1")
+
+    durable = controller.status("run-1")
+    assert durable["operations"]["provision"]["status"] == "dispatched"
+    assert durable["operations"]["provision"]["attempts"] == 1
+    assert [event["kind"] for event in store.read_events("run-1")][-1] == (
+        "provider_operation_dispatched"
+    )
+
+    for _ in range(2):
+        assert controller.reconcile("run-1")["lifecycle"] == LifecycleState.PROVISIONING
+        assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+    assert controller.reconcile("run-1")["lifecycle"] == LifecycleState.STARTING
+    assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+
+def test_dispatched_create_without_visible_resource_enters_bounded_fail_closed_recovery(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        value = datetime(2026, 7, 31, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            return self.value
+
+        def sleep(self, seconds: float) -> None:
+            self.value += timedelta(seconds=seconds)
+
+    clock = Clock()
+    store = RunStore(tmp_path / "runs")
+    provider = MemoryRunPod()
+    controller = LifecycleController(
+        store,
+        provider,
+        now=clock.now,
+        provision_visibility_grace_seconds=5,
+    )
+    controller.plan("run-1", {"job": "noop"}, approved_max_usd="1")
+    controller.reconcile("run-1")
+
+    def crash_before_create(_kind: str, _operation_id: str) -> None:
+        raise SystemExit("simulated death before provider effect")
+
+    provider.before_effect = crash_before_create
+    with pytest.raises(SystemExit, match="before provider effect"):
+        controller.reconcile("run-1")
+    provider.before_effect = None
+    assert controller.status("run-1")["operations"]["provision"]["status"] == "dispatched"
+
+    clock.sleep(6)
+    recovering = controller.reconcile("run-1")
+
+    assert recovering["lifecycle"] == LifecycleState.RECOVERING
+    assert recovering["recovery_reason"] == "provision_dispatch_unresolved"
+    assert recovering["workload_result"] == WorkloadResult.CANCELLED
+    assert recovering["closeout"]["artifact_disposition"]["status"] == (
+        ArtifactDisposition.UNAVAILABLE
+    )
+    assert provider.effects == []
 
 
 def test_unknown_start_is_reconciled_from_resource_state(tmp_path: Path) -> None:

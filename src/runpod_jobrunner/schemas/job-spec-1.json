@@ -32,10 +32,16 @@
     },
     "runner": {
       "type": "object",
-      "required": ["version"],
+      "required": ["version", "git_commit"],
       "properties": {
-        "version": {"type": "string", "minLength": 1},
-        "git_commit": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"}
+        "version": {
+          "type": "string",
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "git_commit": {
+          "type": "string",
+          "pattern": "^(?!(?:0{40}|0{64})$)(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        }
       },
       "additionalProperties": true
     },
@@ -98,7 +104,33 @@
       },
       "additionalProperties": true
     },
-    "artifacts": {"type": "object"},
+    "artifacts": {
+      "type": "object",
+      "required": ["manifest_path"],
+      "properties": {
+        "manifest_path": {"$ref": "#/$defs/safe-relative-path"},
+        "incremental_manifest_glob": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?!.*[\\u0000-\\u001F\\u007F])(?!.*\\\\)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?!.*\\*\\*)(?!.*[?\\[\\]{}])(?=.+[^/]).+$"
+        },
+        "incremental_mirror_ack": {
+          "type": "object",
+          "required": ["required", "directory", "timeout_seconds"],
+          "properties": {
+            "required": {"const": true},
+            "directory": {"$ref": "#/$defs/safe-relative-path"},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true,
+      "dependentRequired": {
+        "incremental_mirror_ack": ["incremental_manifest_glob"]
+      }
+    },
     "lifecycle": {"type": "object"}
   },
   "additionalProperties": true,
@@ -106,6 +138,10 @@
     "positive-money": {
       "type": "string",
       "pattern": "^(?:0\\.[0-9]*[1-9][0-9]*|[1-9][0-9]*(?:\\.[0-9]+)?)$"
+    },
+    "safe-relative-path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?=.+[^/])[^\\u0000]+$"
     },
     "phase": {
       "type": "object",

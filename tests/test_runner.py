@@ -11,10 +11,33 @@ from typing import cast
 
 import pytest
 
-from runpod_jobrunner.runner import PHASE_ORDER, RemoteRunner
+from runpod_jobrunner.identity import RunnerIdentity
+from runpod_jobrunner.launch_authorization import LAUNCH_PROTOCOL, LAUNCH_RELATIVE_PATH
+from runpod_jobrunner.runner import PHASE_ORDER, RemoteRunner, RequestError
+
+TEST_IDENTITY = RunnerIdentity(
+    version="0.1.1",
+    git_commit="a" * 40,
+    supported_protocol_majors={
+        "artifact-manifest": (1,),
+        "launch-authorization": (1,),
+        "run-event": (1,),
+        "run-request": (1,),
+        "run-status": (1,),
+    },
+)
 
 
-def make_request(tmp_path: Path, **overrides: object) -> dict[str, object]:
+def make_request(
+    tmp_path: Path, *, authorize: bool = True, **overrides: object
+) -> dict[str, object]:
+    launch_token = "1" * 64
+    launch_path = (
+        tmp_path / "runpod-jobrunner" / "runs" / "run-test-001" / LAUNCH_RELATIVE_PATH
+    )
+    if authorize:
+        launch_path.parent.mkdir(parents=True, exist_ok=True)
+        launch_path.write_text(f"{launch_token}\n", encoding="ascii")
     trace_path = tmp_path / "phase-trace.txt"
     phases = {
         phase: {
@@ -38,6 +61,15 @@ def make_request(tmp_path: Path, **overrides: object) -> dict[str, object]:
         "run_id": "run-test-001",
         "bundle_hash": "1" * 64,
         "image_digest": "example.invalid/runner@sha256:" + "2" * 64,
+        "runner_version": TEST_IDENTITY.version,
+        "runner_git_commit": TEST_IDENTITY.git_commit,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
         "storage": {
             "encrypted": True,
             "mount": str(tmp_path),
@@ -51,9 +83,114 @@ def make_request(tmp_path: Path, **overrides: object) -> dict[str, object]:
         },
         "heartbeat_interval_seconds": 0.02,
         "termination_grace_seconds": 0.2,
+        "launch_authorization": {
+            "protocol": LAUNCH_PROTOCOL,
+            "path": LAUNCH_RELATIVE_PATH,
+            "sha256": hashlib.sha256(launch_token.encode()).hexdigest(),
+            "size": len(launch_token) + 1,
+            "timeout_seconds": 2,
+        },
     }
     request.update(overrides)
     return request
+
+
+def runner(
+    request: dict[str, object],
+    status_dir: Path,
+    *,
+    request_path: Path | None = None,
+) -> RemoteRunner:
+    return RemoteRunner(
+        request,
+        status_dir,
+        request_path=request_path,
+        runner_identity=TEST_IDENTITY,
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity", "reason"),
+    [
+        (
+            RunnerIdentity(
+                "0.2.0",
+                "a" * 40,
+                {
+                    "artifact-manifest": (1,),
+                    "launch-authorization": (1,),
+                    "run-event": (1,),
+                    "run-request": (1,),
+                    "run-status": (1,),
+                },
+            ),
+            "runner_version_mismatch",
+        ),
+        (
+            RunnerIdentity(
+                "0.1.1",
+                "b" * 40,
+                {
+                    "artifact-manifest": (1,),
+                    "launch-authorization": (1,),
+                    "run-event": (1,),
+                    "run-request": (1,),
+                    "run-status": (1,),
+                },
+            ),
+            "runner_git_commit_mismatch",
+        ),
+        (
+            RunnerIdentity(
+                "0.1.1",
+                "a" * 40,
+                {
+                    "artifact-manifest": (1,),
+                    "launch-authorization": (1,),
+                    "run-event": (1,),
+                    "run-request": (2,),
+                    "run-status": (1,),
+                },
+            ),
+            "unsupported_protocol_major",
+        ),
+    ],
+)
+def test_runner_rejects_identity_mismatch_before_any_phase(
+    tmp_path: Path, identity: RunnerIdentity, reason: str
+) -> None:
+    request = make_request(tmp_path)
+
+    terminal = RemoteRunner(
+        request,
+        tmp_path / "status",
+        runner_identity=identity,
+    ).run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == reason
+    assert not (tmp_path / "phase-trace.txt").exists()
+    status = read_json(tmp_path / "status" / "status.json")
+    assert status["runner_version"] == identity.version
+    assert status["runner_git_commit"] == identity.git_commit
+
+
+def test_missing_published_release_receipt_fails_with_authenticated_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = make_request(tmp_path)
+    monkeypatch.setenv(
+        "RUNPOD_JOBRUNNER_RELEASE_PATH",
+        str(tmp_path / "missing-release.json"),
+    )
+
+    terminal = RemoteRunner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "runner_identity_unavailable"
+    assert not (tmp_path / "phase-trace.txt").exists()
+    status = read_json(tmp_path / "status" / "status.json")
+    assert status["runner_git_commit"] == "0" * 40
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -64,7 +201,7 @@ def test_runner_executes_enabled_phases_in_fixed_order(tmp_path: Path) -> None:
     request = make_request(tmp_path)
     status_dir = tmp_path / "status"
 
-    terminal = RemoteRunner(request, status_dir).run()
+    terminal = runner(request, status_dir).run()
 
     assert terminal["outcome"] == "succeeded"
     assert (tmp_path / "phase-trace.txt").read_text().splitlines() == list(PHASE_ORDER)
@@ -73,6 +210,90 @@ def test_runner_executes_enabled_phases_in_fixed_order(tmp_path: Path) -> None:
     assert status["terminal_result"] == terminal
     events = [json.loads(line) for line in (status_dir / "events.jsonl").read_text().splitlines()]
     assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+
+
+def test_runner_publishes_ready_and_waits_for_matching_launch_authorization(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path, authorize=False)
+    status_dir = tmp_path / "status"
+    remote_runner = runner(request, status_dir)
+    terminals: list[dict[str, object]] = []
+    thread = threading.Thread(target=lambda: terminals.append(remote_runner.run()))
+    thread.start()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if (status_dir / "status.json").exists():
+            status = read_json(status_dir / "status.json")
+            if status["state"] == "ready":
+                break
+        time.sleep(0.005)
+    else:
+        raise AssertionError("runner did not publish ready")
+    time.sleep(0.1)
+    assert thread.is_alive()
+    assert not (tmp_path / "phase-trace.txt").exists()
+    launch = cast(dict[str, object], request["launch_authorization"])
+    launch_path = (
+        tmp_path / "runpod-jobrunner" / "runs" / "run-test-001" / str(launch["path"])
+    )
+    launch_path.parent.mkdir(parents=True, exist_ok=True)
+    launch_path.write_text(f"{'1' * 64}\n", encoding="ascii")
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert terminals[0]["outcome"] == "succeeded"
+    assert (tmp_path / "phase-trace.txt").read_text().splitlines() == list(PHASE_ORDER)
+
+
+def test_runner_times_out_without_launch_authorization_and_starts_no_phase(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path, authorize=False)
+    launch = cast(dict[str, object], request["launch_authorization"])
+    launch["timeout_seconds"] = 0.05
+
+    terminal = runner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "launch_authorization_timeout"
+    assert not (tmp_path / "phase-trace.txt").exists()
+
+
+def test_runner_rejects_tampered_launch_authorization_and_starts_no_phase(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path, authorize=False)
+    launch_path = (
+        tmp_path / "runpod-jobrunner" / "runs" / "run-test-001" / LAUNCH_RELATIVE_PATH
+    )
+    launch_path.parent.mkdir(parents=True)
+    launch_path.write_text(f"{'2' * 64}\n", encoding="ascii")
+
+    terminal = runner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "launch_authorization_invalid"
+    assert not (tmp_path / "phase-trace.txt").exists()
+
+
+def test_runner_rejects_status_token_reuse_as_launch_authorization(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path)
+    launch = cast(dict[str, object], request["launch_authorization"])
+
+    terminal = RemoteRunner(
+        request,
+        tmp_path / "status",
+        runner_identity=TEST_IDENTITY,
+        status_token_sha256=str(launch["sha256"]),
+    ).run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "launch_authorization_invalid"
+    assert not (tmp_path / "phase-trace.txt").exists()
 
 
 def test_success_with_declared_artifacts_publishes_verified_manifest_hash(
@@ -98,7 +319,7 @@ def test_success_with_declared_artifacts_publishes_verified_manifest_hash(
         "timeout_seconds": 5,
     }
 
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     manifest = tmp_path / "artifacts" / "manifest.json"
     assert terminal["outcome"] == "succeeded"
@@ -112,7 +333,7 @@ def test_success_fails_closed_when_declared_artifact_manifest_is_missing(
     request = make_request(tmp_path)
     request["artifact_manifest_path"] = "artifacts/manifest.json"
 
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     assert terminal["outcome"] == "failed"
     assert terminal["reason"] == "artifact_manifest_missing"
@@ -137,7 +358,7 @@ def test_success_fails_closed_when_declared_artifact_hash_is_wrong(tmp_path: Pat
         "timeout_seconds": 5,
     }
 
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     assert terminal["outcome"] == "failed"
     assert terminal["reason"] == "artifact_hash_mismatch"
@@ -154,7 +375,7 @@ def test_runner_never_interprets_phase_argv_as_a_shell_command(tmp_path: Path) -
         "timeout_seconds": 5,
     }
 
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     assert terminal["outcome"] == "failed"
     assert terminal["reason"] == "phase_start_failed"
@@ -177,7 +398,7 @@ def test_phase_timeout_kills_a_process_group_after_bounded_grace(tmp_path: Path)
     request["termination_grace_seconds"] = 0.1
 
     started = time.monotonic()
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     assert time.monotonic() - started < 1
     assert terminal["outcome"] == "timed_out"
@@ -205,7 +426,7 @@ def test_runner_enforces_its_own_elapsed_and_cost_caps(tmp_path: Path) -> None:
         limits.update(limit_overrides)
 
         started = time.monotonic()
-        terminal = RemoteRunner(request, case_dir / "status").run()
+        terminal = runner(request, case_dir / "status").run()
 
         assert time.monotonic() - started < 1
         assert terminal["outcome"] == "limit_exceeded"
@@ -225,9 +446,9 @@ def test_status_heartbeats_remain_parseable_while_a_child_runs(tmp_path: Path) -
         phase_config = cast(dict[str, object], phases[phase])
         phase_config["enabled"] = False
     status_dir = tmp_path / "status"
-    runner = RemoteRunner(request, status_dir)
+    remote_runner = runner(request, status_dir)
     terminals: list[dict[str, object]] = []
-    thread = threading.Thread(target=lambda: terminals.append(runner.run()))
+    thread = threading.Thread(target=lambda: terminals.append(remote_runner.run()))
     thread.start()
     observed_heartbeats: list[float] = []
 
@@ -245,7 +466,7 @@ def test_status_heartbeats_remain_parseable_while_a_child_runs(tmp_path: Path) -
 def test_existing_terminal_result_is_immutable_and_prevents_rerun(tmp_path: Path) -> None:
     request = make_request(tmp_path)
     status_dir = tmp_path / "status"
-    first_terminal = RemoteRunner(request, status_dir).run()
+    first_terminal = runner(request, status_dir).run()
     original_terminal_bytes = (status_dir / "terminal-result.json").read_bytes()
     original_event_bytes = (status_dir / "events.jsonl").read_bytes()
     phases = request["phases"]
@@ -256,7 +477,7 @@ def test_existing_terminal_result_is_immutable_and_prevents_rerun(tmp_path: Path
         "timeout_seconds": 5,
     }
 
-    second_terminal = RemoteRunner(request, status_dir).run()
+    second_terminal = runner(request, status_dir).run()
 
     assert second_terminal == first_terminal
     assert (status_dir / "terminal-result.json").read_bytes() == original_terminal_bytes
@@ -291,11 +512,7 @@ def test_phase_receives_only_run_scoped_path_context_as_explicit_environment(
         cast(dict[str, object], phases[phase])["enabled"] = False
     status_dir = tmp_path / "status"
 
-    terminal = RemoteRunner(
-        request,
-        status_dir,
-        request_path=request_path,
-    ).run()
+    terminal = runner(request, status_dir, request_path=request_path).run()
 
     assert terminal["outcome"] == "succeeded"
     assert json.loads(environment_path.read_text()) == {
@@ -335,7 +552,7 @@ def test_phase_environment_does_not_inherit_controller_style_credentials(
     for phase in PHASE_ORDER[1:]:
         cast(dict[str, object], phases[phase])["enabled"] = False
 
-    terminal = RemoteRunner(request, tmp_path / "status").run()
+    terminal = runner(request, tmp_path / "status").run()
 
     assert terminal["outcome"] == "succeeded"
     assert json.loads(observed.read_text()) == {"runpod": None, "wandb": None}
@@ -379,11 +596,55 @@ def test_restart_resumes_after_durably_completed_phase_without_rerunning_it(
     ]
     (status_dir / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
 
-    terminal = RemoteRunner(request, status_dir).run()
+    terminal = runner(request, status_dir).run()
 
     assert terminal["outcome"] == "succeeded"
     assert terminal["completed_phases"] == ["verify"]
     assert not (tmp_path / "phase-trace.txt").exists()
+
+
+@pytest.mark.parametrize("fragment", [b'{"protocol":', b'{"exit_code":-'])
+def test_restart_truncates_only_a_torn_final_event_record(
+    tmp_path: Path, fragment: bytes
+) -> None:
+    request = make_request(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir()
+    event = {
+        "protocol": "run-event/1",
+        "run_id": "run-test-001",
+        "sequence": 1,
+        "kind": "ready",
+        "phase": None,
+        "monotonic_seconds": 0.1,
+    }
+    durable_prefix = (json.dumps(event) + "\n").encode()
+    journal = status_dir / "events.jsonl"
+    journal.write_bytes(durable_prefix + fragment)
+
+    runner(request, status_dir)
+
+    assert journal.read_bytes() == durable_prefix
+
+
+def test_restart_rejects_a_complete_malformed_event_record(tmp_path: Path) -> None:
+    request = make_request(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir()
+    (status_dir / "events.jsonl").write_bytes(b'{"protocol":}\n')
+
+    with pytest.raises(RequestError, match="invalid JSON"):
+        runner(request, status_dir)
+
+
+def test_restart_rejects_nonterminated_but_complete_malformed_event(tmp_path: Path) -> None:
+    request = make_request(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir()
+    (status_dir / "events.jsonl").write_bytes(b'{"protocol":}')
+
+    with pytest.raises(RequestError, match="incomplete record terminator"):
+        runner(request, status_dir)
 
 
 def test_restart_fails_closed_instead_of_repeating_a_phase_with_unknown_outcome(
@@ -412,7 +673,7 @@ def test_restart_fails_closed_instead_of_repeating_a_phase_with_unknown_outcome(
     ]
     (status_dir / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
 
-    terminal = RemoteRunner(request, status_dir).run()
+    terminal = runner(request, status_dir).run()
 
     assert terminal["outcome"] == "failed"
     assert terminal["reason"] == "runner_restart_unknown_child"

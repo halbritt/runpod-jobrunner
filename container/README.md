@@ -4,8 +4,10 @@ This image is the generic integration target for the fixed-phase remote runner.
 It starts the official RunPod `/start.sh` SSH bootstrap, waits at most 600
 seconds for `request.json` and `status-token` on the encrypted `/workspace`
 volume, and then replaces its wrapper with `runpod-jobrunner-remote`. `tini`
-remains PID 1. The runner serves authenticated, read-only status on port 8080;
-SSH remains on port 22.
+remains PID 1. The runner publishes its release identity as `ready` and waits
+for the separately hash-pinned launch token. The controller sends allow-listed
+inputs only after it authenticates that identity. The runner serves read-only
+status on port 8080; SSH remains on port 22.
 
 The base is the official `runpod/base:1.1.0-ubuntu2404` image pinned to
 `sha256:8fafffd0c67a48117dff09031ed16e79c0a83cc6996472f4b4dcb76343102a66`.
@@ -18,14 +20,14 @@ docker buildx imagetools inspect runpod/base:1.1.0-ubuntu2404
 Build an exact version from a committed source revision:
 
 ```console
-container/build-publish.sh ghcr.io/halbritt/runpod-jobrunner-noop 0.1.0
+container/build-publish.sh ghcr.io/halbritt/runpod-jobrunner-noop 0.1.1
 ```
 
 Publishing is an explicit operation. Authenticate the Docker client without
 putting credentials in the build context, then use `--push`:
 
 ```console
-container/build-publish.sh --push ghcr.io/halbritt/runpod-jobrunner-noop 0.1.0
+container/build-publish.sh --push ghcr.io/halbritt/runpod-jobrunner-noop 0.1.1
 ```
 
 `Dockerfile.dockerignore` allow-lists only the package metadata, Python source,

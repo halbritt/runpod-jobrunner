@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
+from runpod_jobrunner.identity import RunnerIdentityError, parse_protocol_majors
 from runpod_jobrunner.runner import PHASE_ORDER
 
 _STATES = {"ready", "running", "terminal"}
@@ -33,6 +34,12 @@ _REASONS = {
     "artifact_file_missing",
     "artifact_size_mismatch",
     "artifact_hash_mismatch",
+    "runner_version_mismatch",
+    "runner_git_commit_mismatch",
+    "runner_identity_unavailable",
+    "unsupported_protocol_major",
+    "launch_authorization_invalid",
+    "launch_authorization_timeout",
 }
 
 
@@ -143,6 +150,11 @@ def _public_status(candidate: object) -> dict[str, object]:
     public: dict[str, object] = {
         "protocol": "run-status/1",
         "run_id": _string(status.get("run_id")),
+        "runner_version": _string(status.get("runner_version")),
+        "runner_git_commit": _string(status.get("runner_git_commit")),
+        "supported_protocol_majors": _public_protocol_majors(
+            status.get("supported_protocol_majors")
+        ),
         "state": state,
         "phase": phase,
         "heartbeat_age_seconds": round(max(0.0, time.time() - heartbeat_at), 6),
@@ -152,6 +164,14 @@ def _public_status(candidate: object) -> dict[str, object]:
         "terminal_result": _public_terminal(status.get("terminal_result")),
     }
     return public
+
+
+def _public_protocol_majors(candidate: object) -> dict[str, list[int]]:
+    try:
+        parsed = parse_protocol_majors(candidate)
+    except RunnerIdentityError as error:
+        raise StatusRecordError("invalid supported protocol majors") from error
+    return {protocol: list(versions) for protocol, versions in parsed.items()}
 
 
 def _public_child(candidate: object) -> dict[str, object] | None:

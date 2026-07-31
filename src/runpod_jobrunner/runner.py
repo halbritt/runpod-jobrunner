@@ -20,6 +20,23 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import cast
 
+from runpod_jobrunner.identity import (
+    RunnerIdentity,
+    RunnerIdentityError,
+    load_runner_identity,
+    local_source_identity,
+    parse_protocol_majors,
+    validate_git_commit,
+    validate_runner_version,
+)
+from runpod_jobrunner.incremental_ack import ACK_NAMESPACE, ACK_PROTOCOL
+from runpod_jobrunner.launch_authorization import (
+    LaunchAuthorization,
+    LaunchAuthorizationError,
+    parse_launch_authorization,
+    read_launch_token,
+)
+
 PHASE_ORDER = ("verify", "preflight", "train", "evaluate", "package")
 _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _BUNDLE_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -84,8 +101,25 @@ class RemoteRunner:
         status_dir: Path | str,
         *,
         request_path: Path | str | None = None,
+        runner_identity: RunnerIdentity | None = None,
+        status_token_sha256: str | None = None,
     ) -> None:
         self.request = _validate_request(request)
+        self.launch_authorization = parse_launch_authorization(
+            self.request["launch_authorization"]
+        )
+        self._status_token_sha256 = status_token_sha256
+        if runner_identity is not None:
+            self.identity = runner_identity
+            self._identity_failure = _identity_failure(self.request, self.identity)
+        else:
+            try:
+                self.identity = load_runner_identity()
+            except RunnerIdentityError:
+                self.identity = local_source_identity()
+                self._identity_failure = "runner_identity_unavailable"
+            else:
+                self._identity_failure = _identity_failure(self.request, self.identity)
         self.status_dir = Path(status_dir)
         self.status_dir.mkdir(parents=True, exist_ok=True)
         self.status_path = self.status_dir / "status.json"
@@ -108,6 +142,9 @@ class RemoteRunner:
         self._current_phase: str | None = None
         self._recovered_failure: tuple[str, str] | None = None
         self._recover_history(history)
+        self._launch_authorized = any(
+            event.get("kind") == "launch_authorized" for event in history
+        )
         self._child: subprocess.Popen[bytes] | None = None
         self._stop_requested = threading.Event()
         self._stop_reason = "termination_requested"
@@ -153,12 +190,19 @@ class RemoteRunner:
                 self._terminal_result("failed", "runner_restart_unknown_child", interrupted_phase)
             )
 
+        if self._identity_failure is not None:
+            return self._finish(self._terminal_result("failed", self._identity_failure))
+
         storage_reason = self._storage_reason()
         if storage_reason is not None:
             return self._finish(self._terminal_result("failed", storage_reason))
 
         self._append_event("runner_resumed" if self._sequence else "ready")
         self._publish_status("ready")
+
+        launch_failure = self._wait_for_launch_authorization()
+        if launch_failure is not None:
+            return self._finish(self._terminal_result("failed", launch_failure))
 
         for phase in PHASE_ORDER:
             if phase in self._settled_phases:
@@ -180,6 +224,51 @@ class RemoteRunner:
         except ArtifactVerificationError as error:
             terminal = self._terminal_result("failed", error.reason, "package")
         return self._finish(terminal)
+
+    def _wait_for_launch_authorization(self) -> str | None:
+        authorization = self.launch_authorization
+        if authorization.sha256 == self._status_token_sha256:
+            return "launch_authorization_invalid"
+        token_path = self._launch_authorization_path(authorization)
+        deadline = time.monotonic() + authorization.timeout_seconds
+        heartbeat_interval = _number_as_float(self.request["heartbeat_interval_seconds"])
+        next_heartbeat = time.monotonic() + heartbeat_interval
+        while True:
+            if self._stop_requested.is_set():
+                return self._stop_reason
+            if token_path.exists() or token_path.is_symlink():
+                try:
+                    token = read_launch_token(token_path)
+                    size = token_path.stat(follow_symlinks=False).st_size
+                except (LaunchAuthorizationError, OSError):
+                    return "launch_authorization_invalid"
+                if (
+                    size != authorization.size
+                    or hashlib.sha256(token.encode("ascii")).hexdigest()
+                    != authorization.sha256
+                ):
+                    return "launch_authorization_invalid"
+                if not self._launch_authorized:
+                    self._append_event("launch_authorized")
+                    self._launch_authorized = True
+                return None
+            now = time.monotonic()
+            if now >= deadline:
+                return "launch_authorization_timeout"
+            if now >= next_heartbeat:
+                self._publish_status("ready")
+                next_heartbeat = now + heartbeat_interval
+            self._stop_requested.wait(timeout=min(0.05, max(0.0, deadline - now)))
+
+    def _launch_authorization_path(self, authorization: LaunchAuthorization) -> Path:
+        storage = _mapping(self.request["storage"], "storage")
+        run_root = (
+            Path(str(storage["mount"]))
+            / "runpod-jobrunner"
+            / "runs"
+            / self.run_id
+        )
+        return run_root.joinpath(*authorization.relative_path.parts)
 
     def _run_phase(
         self, phase: str, phase_config: Mapping[str, object]
@@ -464,6 +553,7 @@ class RemoteRunner:
         status: dict[str, object] = {
             "protocol": "run-status/1",
             "run_id": self.run_id,
+            **self.identity.as_protocol_fields(),
             "state": state,
             "phase": self._current_phase,
             "heartbeat_sequence": self._sequence,
@@ -545,6 +635,12 @@ def _validate_request(request: Mapping[str, object]) -> dict[str, object]:
     image_digest = request.get("image_digest")
     if not isinstance(image_digest, str) or _IMAGE_DIGEST_PATTERN.fullmatch(image_digest) is None:
         raise RequestError("image_digest must pin an image by sha256 digest")
+    try:
+        validate_runner_version(request.get("runner_version"))
+        validate_git_commit(request.get("runner_git_commit"))
+        parse_protocol_majors(request.get("supported_protocol_majors"))
+    except RunnerIdentityError as error:
+        raise RequestError(str(error)) from error
     storage = _mapping(request.get("storage"), "storage")
     if storage.get("encrypted") is not True:
         raise RequestError("encrypted storage is required")
@@ -576,7 +672,53 @@ def _validate_request(request: Mapping[str, object]) -> dict[str, object]:
     artifact_manifest_path = request.get("artifact_manifest_path")
     if artifact_manifest_path is not None:
         _safe_relative_path(artifact_manifest_path, "artifact_manifest_path")
+    acknowledgement = request.get("incremental_mirror_ack")
+    if acknowledgement is not None:
+        ack = _mapping(acknowledgement, "incremental_mirror_ack")
+        if ack.get("protocol") != ACK_PROTOCOL:
+            raise RequestError("incremental mirror acknowledgement protocol is unsupported")
+        _safe_relative_path(ack.get("directory"), "incremental_mirror_ack.directory")
+        _positive_number(ack.get("timeout_seconds"), "incremental_mirror_ack.timeout_seconds")
+        signer = _mapping(ack.get("signer"), "incremental_mirror_ack.signer")
+        if (
+            signer.get("algorithm") != "ssh-ed25519"
+            or signer.get("namespace") != ACK_NAMESPACE
+            or not isinstance(signer.get("identity"), str)
+            or not isinstance(signer.get("key_id"), str)
+            or not isinstance(signer.get("public_key"), str)
+        ):
+            raise RequestError("incremental mirror acknowledgement signer is invalid")
+    try:
+        parse_launch_authorization(request.get("launch_authorization"))
+    except LaunchAuthorizationError as error:
+        raise RequestError(str(error)) from error
     return dict(request)
+
+
+def _identity_failure(request: Mapping[str, object], identity: RunnerIdentity) -> str | None:
+    if request["runner_version"] != identity.version:
+        return "runner_version_mismatch"
+    if request["runner_git_commit"] != identity.git_commit:
+        return "runner_git_commit_mismatch"
+    requested_majors = parse_protocol_majors(request["supported_protocol_majors"])
+    for protocol in (
+        "artifact-manifest",
+        "launch-authorization",
+        "run-event",
+        "run-request",
+        "run-status",
+    ):
+        if (
+            1 not in requested_majors.get(protocol, ())
+            or 1 not in identity.supported_protocol_majors.get(protocol, ())
+        ):
+            return "unsupported_protocol_major"
+    if request.get("incremental_mirror_ack") is not None and (
+        1 not in requested_majors.get("incremental-mirror-ack", ())
+        or 1 not in identity.supported_protocol_majors.get("incremental-mirror-ack", ())
+    ):
+        return "unsupported_protocol_major"
+    return None
 
 
 def _safe_relative_path(candidate: object, name: str) -> str:
@@ -722,42 +864,92 @@ def _decimal_text(candidate: Decimal) -> str:
 def _read_event_history(events_path: Path, run_id: str) -> list[dict[str, object]]:
     if not events_path.exists():
         return []
+    try:
+        journal = events_path.read_bytes()
+    except OSError as error:
+        raise RequestError("events.jsonl is unavailable") from error
+    if journal and not journal.endswith(b"\n"):
+        final_record_offset = journal.rfind(b"\n") + 1
+        if not _is_torn_json_fragment(journal[final_record_offset:]):
+            raise RequestError("events.jsonl contains an incomplete record terminator")
+        descriptor = os.open(events_path, os.O_WRONLY)
+        try:
+            os.ftruncate(descriptor, final_record_offset)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(events_path.parent)
+        journal = journal[:final_record_offset]
+    try:
+        lines = journal.decode().splitlines()
+    except UnicodeDecodeError as error:
+        raise RequestError("events.jsonl contains invalid JSON") from error
     history: list[dict[str, object]] = []
     expected_sequence = 1
-    with events_path.open() as events:
-        for line in events:
-            if line.strip():
-                try:
-                    event = _mapping(json.loads(line), "events.jsonl event")
-                except json.JSONDecodeError as error:
-                    raise RequestError("events.jsonl contains invalid JSON") from error
-                if event.get("protocol") != "run-event/1" or event.get("run_id") != run_id:
-                    raise RequestError("events.jsonl does not belong to this run")
-                sequence = event.get("sequence")
-                if (
-                    isinstance(sequence, bool)
-                    or not isinstance(sequence, int)
-                    or sequence != expected_sequence
-                ):
-                    raise RequestError("events.jsonl sequence is not contiguous")
-                kind = event.get("kind")
-                if kind not in {
-                    "ready",
-                    "runner_resumed",
-                    "phase_started",
-                    "phase_completed",
-                    "phase_failed",
-                    "phase_start_failed",
-                    "phase_disabled",
-                    "terminal",
-                }:
-                    raise RequestError("events.jsonl contains an unknown event kind")
-                phase = event.get("phase")
-                if phase is not None and phase not in PHASE_ORDER:
-                    raise RequestError("events.jsonl contains an unknown phase")
-                history.append(event)
-                expected_sequence += 1
+    for line in lines:
+        if line.strip():
+            try:
+                event = _mapping(json.loads(line), "events.jsonl event")
+            except json.JSONDecodeError as error:
+                raise RequestError("events.jsonl contains invalid JSON") from error
+            if event.get("protocol") != "run-event/1" or event.get("run_id") != run_id:
+                raise RequestError("events.jsonl does not belong to this run")
+            sequence = event.get("sequence")
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence != expected_sequence
+            ):
+                raise RequestError("events.jsonl sequence is not contiguous")
+            kind = event.get("kind")
+            if kind not in {
+                "ready",
+                "runner_resumed",
+                "launch_authorized",
+                "phase_started",
+                "phase_completed",
+                "phase_failed",
+                "phase_start_failed",
+                "phase_disabled",
+                "terminal",
+            }:
+                raise RequestError("events.jsonl contains an unknown event kind")
+            phase = event.get("phase")
+            if phase is not None and phase not in PHASE_ORDER:
+                raise RequestError("events.jsonl contains an unknown phase")
+            history.append(event)
+            expected_sequence += 1
     return history
+
+
+def _is_torn_json_fragment(fragment: bytes) -> bool:
+    try:
+        text = fragment.decode()
+    except UnicodeDecodeError as error:
+        return error.end == len(fragment) and error.reason == "unexpected end of data"
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as error:
+        if error.pos == len(text) or error.msg.startswith("Unterminated string"):
+            return True
+        suffix = text[error.pos:]
+        if error.msg == "Expecting value" and (
+            suffix == "-"
+            or any(literal.startswith(suffix) for literal in ("true", "false", "null"))
+        ):
+            return True
+        if error.msg == "Invalid \\uXXXX escape" and suffix.startswith("u"):
+            return len(suffix) < 5
+        return error.msg == "Expecting ',' delimiter" and suffix in {
+            ".",
+            "e",
+            "E",
+            "e+",
+            "e-",
+            "E+",
+            "E-",
+        }
+    return False
 
 
 def _prior_elapsed_seconds(
@@ -843,6 +1035,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _load_request(arguments.request),
         arguments.status_dir,
         request_path=arguments.request,
+        status_token_sha256=hashlib.sha256(token.encode("ascii")).hexdigest(),
     )
     _install_signal_handlers(runner)
     server = StatusHTTPServer(

@@ -132,16 +132,53 @@ def test_unencrypted_create_is_deleted_before_returning_error() -> None:
     assert opener.requests[1].full_url.endswith("/pods/pod-unsafe")
 
 
-def test_graphql_errors_are_typed_and_do_not_leak_key() -> None:
+def test_graphql_create_errors_are_unknown_and_do_not_leak_key() -> None:
     opener = RecordingOpener(
         [{"errors": [{"message": "no capacity"}], "data": {"podFindAndDeployOnDemand": None}}]
     )
     api = RunPodHTTP("very-secret", opener=opener)
 
-    with pytest.raises(ProviderProtocolError, match="no capacity") as caught:
+    with pytest.raises(RunPodTransportOutcomeUnknown, match="no capacity") as caught:
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
     assert "very-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not JSON",
+        b'{"data":{}}',
+        (
+            b'{"data":{"podFindAndDeployOnDemand":{"id":"pod-1",'
+            b'"name":"rj-run-01-create-01","costPerHr":"not-money",'
+            b'"volumeEncrypted":true}}}'
+        ),
+    ],
+)
+def test_create_maps_ambiguous_protocol_responses_to_unknown(raw: bytes) -> None:
+    class RawOpener:
+        def open(self, request: Any, timeout: float) -> Response:
+            del request, timeout
+            return Response(raw)
+
+    api = RunPodHTTP("secret", opener=RawOpener())
+
+    with pytest.raises(RunPodTransportOutcomeUnknown):
+        api.create_encrypted_pod(create_request(), volume_key="z" * 30)
+
+
+def test_create_maps_http_500_to_unknown() -> None:
+    class FailingOpener:
+        def open(self, request: Any, timeout: float) -> Response:
+            del timeout
+            raise HTTPError(request.full_url, 500, "server error", Message(), None)
+
+    api = RunPodHTTP("secret", opener=FailingOpener())
+
+    with pytest.raises(RunPodTransportOutcomeUnknown):
+        api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
 
 def test_exact_name_reconciliation_and_spend() -> None:
@@ -262,6 +299,24 @@ def test_production_adapter_maps_unknown_create_outcome(tmp_path: Path) -> None:
             raise RunPodTransportOutcomeUnknown("POST")
 
     provider = RunPodProvider(UnknownAPI(), secrets_root=tmp_path / "secrets")
+
+    with pytest.raises(ProviderOutcomeUnknown) as caught:
+        provider.create(provider_request())
+
+    assert caught.value.operation_id == provider_request().operation_id
+
+
+def test_production_adapter_maps_post_dispatch_protocol_error_to_unknown(
+    tmp_path: Path,
+) -> None:
+    class MalformedCreateAPI(FakeAPI):
+        def create_encrypted_pod(
+            self, request: PodCreateRequest, *, volume_key: str
+        ) -> PodObservation:
+            del request, volume_key
+            raise ProviderProtocolError("RunPod returned invalid JSON")
+
+    provider = RunPodProvider(MalformedCreateAPI(), secrets_root=tmp_path / "secrets")
 
     with pytest.raises(ProviderOutcomeUnknown) as caught:
         provider.create(provider_request())

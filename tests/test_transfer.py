@@ -7,7 +7,14 @@ from typing import Any
 
 import pytest
 
-from runpod_jobrunner.transfer import LocalTransfer, RcloneSFTP, TransferError
+from runpod_jobrunner.transfer import (
+    LocalTransfer,
+    RcloneSFTP,
+    RemoteFile,
+    TransferError,
+    TransferUnavailable,
+    validate_discovery_pattern,
+)
 
 
 def digest(data: bytes) -> str:
@@ -54,6 +61,25 @@ def test_local_upload_rejects_symlink_and_mutation(tmp_path: Path) -> None:
         )
 
 
+def test_local_atomic_publish_exposes_only_the_complete_file(tmp_path: Path) -> None:
+    source = tmp_path / "launch-token"
+    payload = b"1" * 64 + b"\n"
+    source.write_bytes(payload)
+    destination = tmp_path / "remote" / "control" / "launch-token"
+
+    receipt = LocalTransfer().publish_atomic(
+        source,
+        destination,
+        size=len(payload),
+        sha256=digest(payload),
+    )
+
+    assert destination.read_bytes() == payload
+    assert list(destination.parent.glob(".*.partial-*")) == []
+    assert receipt.files == 1
+    assert receipt.bytes == len(payload)
+
+
 def test_rclone_requires_known_host_and_uses_files_from(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
@@ -95,6 +121,47 @@ def test_rclone_refuses_missing_known_hosts(tmp_path: Path) -> None:
             key_file=tmp_path / "key",
             known_hosts_file=tmp_path / "missing",
         )
+
+
+def test_rclone_atomic_publish_stages_then_server_side_renames(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    known_hosts = tmp_path / "known_hosts"
+    key = tmp_path / "id_ed25519"
+    known_hosts.write_text("host ssh-ed25519 AAAA\n")
+    key.write_text("key")
+    source = tmp_path / "launch-token"
+    payload = b"1" * 64 + b"\n"
+    source.write_bytes(payload)
+    transfer = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=key,
+        known_hosts_file=known_hosts,
+        run_command=run,
+    )
+
+    receipt = transfer.publish_atomic(
+        source,
+        "/workspace/control/launch-token",
+        size=len(payload),
+        sha256=digest(payload),
+    )
+
+    assert calls[0][0:2] == ["rclone", "copyto"]
+    assert calls[0][2] == str(source.resolve())
+    staging = calls[0][3]
+    assert staging.startswith(":sftp:/workspace/control/.launch-token.partial-")
+    assert calls[1][0:2] == ["rclone", "moveto"]
+    assert calls[1][2] == staging
+    assert calls[1][3] == ":sftp:/workspace/control/launch-token"
+    assert receipt.files == 1
+    assert receipt.bytes == len(payload)
 
 
 def test_rclone_downloads_only_declared_files_then_verifies_local_bytes(
@@ -163,3 +230,174 @@ def test_rclone_download_rejects_corrupt_received_file(tmp_path: Path) -> None:
             tmp_path / "receipts",
             [{"path": "result.bin", "size": 7, "sha256": digest(b"expected")}],
         )
+
+
+def test_local_discovery_is_bounded_safe_and_does_not_follow_symlinks(tmp_path: Path) -> None:
+    root = tmp_path / "remote"
+    first = root / "checkpoints" / "checkpoint-25" / "checkpoint-complete.json"
+    first.parent.mkdir(parents=True)
+    first.write_text("{}")
+    second = root / "checkpoints" / "checkpoint-50" / "checkpoint-complete.json"
+    second.parent.mkdir(parents=True)
+    second.write_text("{}")
+
+    discovered = LocalTransfer().discover(
+        root,
+        "checkpoints/checkpoint-*/checkpoint-complete.json",
+        max_matches=2,
+    )
+
+    assert [entry.path for entry in discovered] == [
+        "checkpoints/checkpoint-25/checkpoint-complete.json",
+        "checkpoints/checkpoint-50/checkpoint-complete.json",
+    ]
+    with pytest.raises(TransferError, match="more than 1"):
+        LocalTransfer().discover(
+            root,
+            "checkpoints/checkpoint-*/checkpoint-complete.json",
+            max_matches=1,
+        )
+    first.unlink()
+    first.symlink_to(tmp_path / "outside")
+    with pytest.raises(TransferError, match="symlink"):
+        LocalTransfer().discover(
+            root,
+            "checkpoints/checkpoint-*/checkpoint-complete.json",
+            max_matches=2,
+        )
+
+
+def test_discovery_plan_uses_fixed_prefix_and_rejects_control_characters() -> None:
+    plan = validate_discovery_pattern(
+        "checkpoints/checkpoint-*/checkpoint-complete.json"
+    )
+
+    assert plan.fixed_prefix == "checkpoints"
+    assert plan.relative_pattern == "checkpoint-*/checkpoint-complete.json"
+    for unsafe in (
+        "checkpoints/checkpoint-*\n/checkpoint-complete.json",
+        "checkpoints/checkpoint-\x7f/checkpoint-complete.json",
+    ):
+        with pytest.raises(TransferError, match="control"):
+            validate_discovery_pattern(unsafe)
+
+
+def test_rclone_discovery_parses_bounded_json_and_rejects_symlink_notice(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+    known_hosts = tmp_path / "known_hosts"
+    key = tmp_path / "id_ed25519"
+    known_hosts.write_text("host ssh-ed25519 AAAA\n")
+    key.write_text("key")
+
+    def run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                '[{"Path":"checkpoints/checkpoint-25/checkpoint-complete.json",'
+                '"Size":123,"ModTime":"2026-07-31T12:00:00Z","IsDir":false}]'
+            ),
+            stderr="",
+        )
+
+    transfer = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=key,
+        known_hosts_file=known_hosts,
+        run_command=run,
+    )
+
+    found = transfer.discover(
+        "/workspace",
+        "checkpoints/checkpoint-*/checkpoint-complete.json",
+        max_matches=8,
+    )
+
+    assert found == (
+        RemoteFile(
+            path="checkpoints/checkpoint-25/checkpoint-complete.json",
+            size=123,
+            modified_at="2026-07-31T12:00:00Z",
+        ),
+    )
+    assert calls[0][:2] == ["rclone", "lsjson"]
+    assert "--include" in calls[0]
+    assert "--max-depth" in calls[0]
+    assert "--sftp-skip-links" in calls[0]
+
+    def symlink_run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        return CompletedProcess(argv, 0, stdout="[]", stderr="NOTICE: cannot follow symlink")
+
+    unsafe = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=key,
+        known_hosts_file=known_hosts,
+        run_command=symlink_run,
+    )
+    with pytest.raises(TransferError, match="symlink"):
+        unsafe.discover(
+            "/workspace",
+            "checkpoints/checkpoint-*/checkpoint-complete.json",
+            max_matches=8,
+        )
+
+
+def test_rclone_list_failure_is_distinctly_retryable(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 AAAA\n")
+
+    def run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        return CompletedProcess(argv, 255, stdout="", stderr="connection closed")
+
+    transfer = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=tmp_path / "key",
+        known_hosts_file=known_hosts,
+        run_command=run,
+    )
+    with pytest.raises(TransferUnavailable, match="outcome unknown"):
+        transfer.discover(
+            "/workspace",
+            "checkpoints/checkpoint-*/checkpoint-complete.json",
+            max_matches=8,
+        )
+
+
+def test_rclone_missing_fixed_discovery_subtree_is_an_empty_listing(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 AAAA\n")
+
+    def run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        return CompletedProcess(
+            argv,
+            3,
+            stdout="",
+            stderr="Failed to lsjson: directory not found",
+        )
+
+    transfer = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=tmp_path / "key",
+        known_hosts_file=known_hosts,
+        run_command=run,
+    )
+
+    assert (
+        transfer.discover(
+            "/workspace/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+            max_matches=8,
+        )
+        == ()
+    )

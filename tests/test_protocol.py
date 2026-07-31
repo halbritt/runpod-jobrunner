@@ -1,3 +1,4 @@
+import hashlib
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator
 
+from runpod_jobrunner.identity import RunnerIdentity
 from runpod_jobrunner.lifecycle import ArtifactDisposition, LifecycleController, WorkloadResult
 from runpod_jobrunner.protocol import (
     CanonicalJSONError,
@@ -27,6 +29,18 @@ PROTOCOLS = (
     "run-request/1",
     "run-status/1",
 )
+LAUNCH_TOKEN = "1" * 64
+LAUNCH_SHA256 = hashlib.sha256(LAUNCH_TOKEN.encode("ascii")).hexdigest()
+
+
+def launch_authorization() -> dict[str, object]:
+    return {
+        "protocol": "launch-authorization/1",
+        "path": "control/launch-authorization.token",
+        "sha256": LAUNCH_SHA256,
+        "size": 65,
+        "timeout_seconds": 2,
+    }
 
 
 def test_canonical_json_sorts_keys_and_preserves_exact_decimal_numbers() -> None:
@@ -63,7 +77,16 @@ def test_packaged_run_request_schema_accepts_the_current_runner_contract() -> No
         "run_id": "run-schema-001",
         "bundle_hash": "a" * 64,
         "image_digest": "example.invalid/runner@sha256:" + "b" * 64,
-        "runner_version": "0.1.0",
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
+        "launch_authorization": launch_authorization(),
         "phases": {
             phase: {
                 "enabled": phase == "verify",
@@ -94,6 +117,11 @@ def test_packaged_run_request_schema_accepts_the_current_runner_contract() -> No
         "timeout_seconds": 30,
     }
     with pytest.raises(ValueError, match=r"request\.phases"):
+        validate_protocol(record, "run-request/1", subject="request")
+
+    record["phases"].pop("surprise")
+    record["runner_git_commit"] = "0" * 40
+    with pytest.raises(ValueError, match="runner_git_commit"):
         validate_protocol(record, "run-request/1", subject="request")
 
 
@@ -132,6 +160,15 @@ def test_run_status_schema_accepts_remote_and_lifecycle_projections() -> None:
     remote_status = {
         "protocol": "run-status/1",
         "run_id": "run-schema-001",
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
         "state": "terminal",
         "phase": "package",
         "heartbeat_sequence": 8,
@@ -169,9 +206,7 @@ def test_run_status_schema_accepts_remote_and_lifecycle_projections() -> None:
             "state": "running",
             "hourly_rate_usd": "0.24",
         },
-        "operations": {
-            "delete": {"id": "op-delete", "status": "acknowledged_all", "attempts": 1}
-        },
+        "operations": {"delete": {"id": "op-delete", "status": "acknowledged_all", "attempts": 1}},
         "recovery_reason": None,
         "closeout": {
             "artifact_disposition": {"status": "verified", "detail": "hashes matched"},
@@ -223,9 +258,7 @@ def test_closeout_receipt_schema_requires_the_lifecycle_closeout_proof() -> None
         "workload_result": "succeeded",
         "approved_max_usd": "0.50",
         "resource": {"id": "pod-one"},
-        "operations": {
-            "delete": {"id": "op-delete", "status": "acknowledged_all", "attempts": 1}
-        },
+        "operations": {"delete": {"id": "op-delete", "status": "acknowledged_all", "attempts": 1}},
         "recovery_reason": None,
         "closeout": {
             "artifact_disposition": {"status": "verified", "detail": "hashes matched"},
@@ -253,9 +286,18 @@ def test_current_remote_runner_records_conform_to_the_packaged_schemas(tmp_path:
         "run_id": "run-schema-runtime",
         "bundle_hash": "e" * 64,
         "image_digest": "example.invalid/runner@sha256:" + "f" * 64,
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
+        "launch_authorization": launch_authorization(),
         "phases": {
-            phase: {"enabled": False, "argv": [], "timeout_seconds": 1}
-            for phase in PHASE_ORDER
+            phase: {"enabled": False, "argv": [], "timeout_seconds": 1} for phase in PHASE_ORDER
         },
         "limits": {
             "max_elapsed_seconds": 30,
@@ -267,9 +309,33 @@ def test_current_remote_runner_records_conform_to_the_packaged_schemas(tmp_path:
         "storage": {"encrypted": True, "mount": str(tmp_path), "required_gb": 1},
     }
     status_dir = tmp_path / "status"
+    launch_path = (
+        tmp_path
+        / "runpod-jobrunner"
+        / "runs"
+        / "run-schema-runtime"
+        / "control"
+        / "launch-authorization.token"
+    )
+    launch_path.parent.mkdir(parents=True)
+    launch_path.write_text(f"{LAUNCH_TOKEN}\n")
 
     validate_protocol(request, "run-request/1", subject="request")
-    RemoteRunner(request, status_dir).run()
+    RemoteRunner(
+        request,
+        status_dir,
+        runner_identity=RunnerIdentity(
+            version="0.1.1",
+            git_commit="a" * 40,
+            supported_protocol_majors={
+                "artifact-manifest": (1,),
+                "launch-authorization": (1,),
+                "run-event": (1,),
+                "run-request": (1,),
+                "run-status": (1,),
+            },
+        ),
+    ).run()
 
     status = json.loads((status_dir / "status.json").read_text())
     validate_protocol(status, "run-status/1", subject="status")

@@ -8,6 +8,7 @@ readonly status_dir="${RUNPOD_JOBRUNNER_STATUS_DIR:-/workspace/runpod-jobrunner/
 readonly token_file="${RUNPOD_JOBRUNNER_TOKEN_FILE:-/workspace/runpod-jobrunner/status-token}"
 readonly wait_seconds="${RUNPOD_JOBRUNNER_REQUEST_WAIT_SECONDS:-600}"
 readonly retention_seconds="${RUNPOD_JOBRUNNER_STATUS_RETENTION_SECONDS:-3600}"
+export RUNPOD_JOBRUNNER_RELEASE_PATH=/opt/runpod-jobrunner/release.json
 
 case "${wait_seconds}" in
     ''|*[!0-9]*)

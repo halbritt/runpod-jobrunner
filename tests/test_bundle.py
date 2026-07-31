@@ -40,7 +40,7 @@ def _write_bundle(root: Path, *, image: str | None = None) -> tuple[dict[str, An
         "protocol": "job-spec/1",
         "name": "noop",
         "image": image or "ghcr.io/halbritt/runpod-jobrunner-noop@sha256:" + "a" * 64,
-        "runner": {"version": "0.1.0"},
+        "runner": {"version": "0.1.1", "git_commit": "a" * 40},
         "inputs": {"manifest": "input-manifest.json"},
         "phases": {
             name: {
@@ -107,7 +107,16 @@ def test_check_returns_immutable_normalized_bundle(tmp_path: Path) -> None:
         "run_id": "run-01K3Y2GB5CJ1FV3NCB7KQ9Z8ZX",
         "bundle_hash": bundle.bundle_hash,
         "image_digest": bundle.image_digest,
-        "runner_version": "0.1.0",
+        "runner_version": "0.1.1",
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "incremental-mirror-ack": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
         "phases": {
             name: {
                 "enabled": name in {"verify", "package"},
@@ -132,6 +141,15 @@ def test_tag_only_image_is_rejected(tmp_path: Path) -> None:
     _write_bundle(tmp_path, image="ghcr.io/halbritt/runpod-jobrunner-noop:latest")
 
     with pytest.raises(BundleValidationError, match="image"):
+        check_bundle(tmp_path)
+
+
+def test_all_zero_runner_commit_is_rejected_before_admission(tmp_path: Path) -> None:
+    spec, manifest = _write_bundle(tmp_path)
+    spec["runner"]["git_commit"] = "0" * 40
+    _rewrite_spec(tmp_path, spec, manifest)
+
+    with pytest.raises(BundleValidationError, match="git_commit"):
         check_bundle(tmp_path)
 
 
@@ -220,4 +238,28 @@ def test_manifest_requires_exact_sha256_and_size(tmp_path: Path) -> None:
     _rewrite_spec(tmp_path, spec, manifest)
 
     with pytest.raises(BundleValidationError, match="sha256"):
+        check_bundle(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "../checkpoint-*/checkpoint-complete.json",
+        "/checkpoints/checkpoint-*/checkpoint-complete.json",
+        "checkpoints/**/checkpoint-complete.json",
+        "checkpoints/checkpoint-?/checkpoint-complete.json",
+        "checkpoints/checkpoint-*/../checkpoint-complete.json",
+        "checkpoints/checkpoint-*/checkpoint-*.json",
+        "checkpoints/checkpoint-*\n/checkpoint-complete.json",
+        "checkpoints/checkpoint-\x7f/checkpoint-complete.json",
+    ),
+)
+def test_incremental_manifest_glob_rejects_unsafe_or_variable_completion_names(
+    tmp_path: Path, value: str
+) -> None:
+    spec, manifest = _write_bundle(tmp_path)
+    spec["artifacts"]["incremental_manifest_glob"] = value
+    _rewrite_spec(tmp_path, spec, manifest)
+
+    with pytest.raises(BundleValidationError, match="incremental_manifest_glob"):
         check_bundle(tmp_path)

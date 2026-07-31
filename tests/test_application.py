@@ -4,6 +4,7 @@ import hashlib
 import json
 import sys
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,19 +21,43 @@ from runpod_jobrunner.application import (
     SupervisorEngine,
 )
 from runpod_jobrunner.bundle import compute_bundle_hash
-from runpod_jobrunner.lifecycle import ArtifactDisposition, LifecycleController, LifecycleState
+from runpod_jobrunner.identity import RunnerIdentity
+from runpod_jobrunner.incremental_ack import load_ack_signer
+from runpod_jobrunner.lifecycle import (
+    ArtifactDisposition,
+    LifecycleController,
+    LifecycleState,
+    WorkloadResult,
+)
 from runpod_jobrunner.protocol import validate_protocol
 from runpod_jobrunner.provider import MemoryRunPod, ProviderCreateRequest
 from runpod_jobrunner.run_store import RunStore
 
 PHASES = ("verify", "preflight", "train", "evaluate", "package")
+TEST_IDENTITY = RunnerIdentity(
+    version="0.1.1",
+    git_commit="a" * 40,
+    supported_protocol_majors={
+        "artifact-manifest": (1,),
+        "launch-authorization": (1,),
+        "run-event": (1,),
+        "run-request": (1,),
+        "run-status": (1,),
+    },
+)
 
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def make_bundle(root: Path, *, fail: bool = False) -> Path:
+def make_bundle(
+    root: Path,
+    *,
+    fail: bool = False,
+    incremental_manifest_glob: str | None = None,
+    incremental_ack: bool = False,
+) -> Path:
     inputs = root / "inputs"
     inputs.mkdir(parents=True)
     payload = b"exact input\n"
@@ -69,7 +94,7 @@ def make_bundle(root: Path, *, fail: bool = False) -> Path:
         "protocol": "job-spec/1",
         "name": "local-failure" if fail else "local-noop",
         "image": "ghcr.io/example/noop@sha256:" + "a" * 64,
-        "runner": {"version": "0.1.0"},
+        "runner": {"version": "0.1.1", "git_commit": "a" * 40},
         "resources": {
             "gpu_types": ["NVIDIA RTX 2000 Ada Generation"],
             "gpu_count": 1,
@@ -86,7 +111,25 @@ def make_bundle(root: Path, *, fail: bool = False) -> Path:
         },
         "heartbeat_interval_seconds": 1,
         "termination_grace_seconds": 1,
-        "artifacts": {"manifest_path": "artifacts/manifest.json"},
+        "artifacts": {
+            "manifest_path": "artifacts/manifest.json",
+            **(
+                {"incremental_manifest_glob": incremental_manifest_glob}
+                if incremental_manifest_glob is not None
+                else {}
+            ),
+            **(
+                {
+                    "incremental_mirror_ack": {
+                        "required": True,
+                        "directory": "control/incremental-acks",
+                        "timeout_seconds": 30,
+                    }
+                }
+                if incremental_ack
+                else {}
+            ),
+        },
         "lifecycle": {"delete_after_terminal": True},
     }
     spec["bundle_hash"] = compute_bundle_hash(spec, manifest)
@@ -130,7 +173,10 @@ def test_check_does_not_require_a_supervisor_executable(tmp_path: Path) -> None:
 
 
 def test_run_persists_intent_before_launch_and_never_uses_full_approval(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path / "bundle")
+    bundle = make_bundle(
+        tmp_path / "bundle",
+        incremental_manifest_glob="checkpoints/checkpoint-*/checkpoint-complete.json",
+    )
     store = RunStore(tmp_path / "runs")
     supervisor = RecordingSupervisor(store)
     app = JobRunner(
@@ -148,6 +194,76 @@ def test_run_persists_intent_before_launch_and_never_uses_full_approval(tmp_path
     assert request["remote"]["limits"]["max_cost_usd"] == "0.50"
     assert request["provider"]["terminate_at"].endswith("Z")
     assert request["provider"]["image"].endswith("@sha256:" + "a" * 64)
+    assert request["controller"]["incremental_manifest_glob"] == (
+        "checkpoints/checkpoint-*/checkpoint-complete.json"
+    )
+    assert "incremental_manifest_glob" not in request["remote"]
+
+
+def test_run_pins_a_distinct_launch_authorization_without_exposing_its_token(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    store = RunStore(tmp_path / "runs")
+    supervisor = RecordingSupervisor(store)
+    app = JobRunner(
+        store,
+        supervisor,
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-launch",
+    )
+
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+
+    request = store.read_request(run_id)
+    launch = request["remote"]["launch_authorization"]
+    launch_token_path = store.paths(run_id).directory / "secrets" / "launch-authorization.token"
+    launch_token = launch_token_path.read_text(encoding="ascii").strip()
+    status_token = (
+        store.paths(run_id).directory / "secrets" / "status-token"
+    ).read_text(encoding="ascii").strip()
+    assert launch == {
+        "protocol": "launch-authorization/1",
+        "path": "control/launch-authorization.token",
+        "sha256": hashlib.sha256(launch_token.encode()).hexdigest(),
+        "size": len(launch_token) + 1,
+        "timeout_seconds": 60,
+    }
+    assert request["remote"]["supported_protocol_majors"]["launch-authorization"] == [1]
+    assert launch_token and launch_token != status_token
+    assert launch_token_path.stat().st_mode & 0o777 == 0o600
+    assert launch_token not in json.dumps(request)
+
+
+def test_acknowledgement_signer_is_created_before_launch_and_request_is_public_only(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(
+        tmp_path / "bundle",
+        incremental_manifest_glob="checkpoints/checkpoint-*/checkpoint-complete.json",
+        incremental_ack=True,
+    )
+    store = RunStore(tmp_path / "runs")
+    supervisor = RecordingSupervisor(store)
+    app = JobRunner(
+        store,
+        supervisor,
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-ack",
+    )
+
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+
+    request = store.read_request(run_id)
+    signer = load_ack_signer(store.paths(run_id).directory, run_id)
+    remote_ack = request["remote"]["incremental_mirror_ack"]
+    assert supervisor.launched == [run_id]
+    assert request["controller"]["incremental_mirror_ack"] == remote_ack
+    assert remote_ack["signer"] == signer.public_fields()
+    assert signer.private_key.stat().st_mode & 0o777 == 0o600
+    serialized = json.dumps(request)
+    assert "PRIVATE KEY" not in serialized
+    assert str(signer.private_key) not in serialized
 
 
 def test_run_rejects_job_cap_above_explicit_approval(tmp_path: Path) -> None:
@@ -195,7 +311,11 @@ def test_local_noop_reaches_verified_closed_state(tmp_path: Path) -> None:
     )
     run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
     provider = MemoryRunPod()
-    engine = SupervisorEngine(store, provider, LocalRunnerExecutor())
+    engine = SupervisorEngine(
+        store,
+        provider,
+        LocalRunnerExecutor(runner_identity=TEST_IDENTITY),
+    )
 
     state = engine.drive(run_id)
 
@@ -209,6 +329,41 @@ def test_local_noop_reaches_verified_closed_state(tmp_path: Path) -> None:
     validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
     assert receipt["closeout"] == state["closeout"]
     assert receipt["event_sequence"] == state["event_sequence"]
+
+
+def test_local_identity_mismatch_uploads_no_inputs_starts_no_phase_and_deletes(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-local-mismatch",
+    )
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+    provider = MemoryRunPod()
+    mismatched = RunnerIdentity(
+        version=TEST_IDENTITY.version,
+        git_commit="b" * 40,
+        supported_protocol_majors=TEST_IDENTITY.supported_protocol_majors,
+    )
+
+    state = SupervisorEngine(
+        store,
+        provider,
+        LocalRunnerExecutor(runner_identity=mismatched),
+    ).drive(run_id)
+
+    remote = store.paths(run_id).directory / "remote"
+    assert state["lifecycle"] == LifecycleState.CLOSED
+    assert state["workload_result"] == WorkloadResult.FAILED
+    assert [effect.kind for effect in provider.effects].count("delete") == 1
+    assert not (remote / "input").exists()
+    assert not list((remote / "storage").rglob("input.txt"))
+    events = [json.loads(line) for line in (remote / "events.jsonl").read_text().splitlines()]
+    assert all(event["kind"] != "phase_started" for event in events)
 
 
 def test_missing_resource_before_start_closes_without_dispatching_workload(
@@ -283,6 +438,45 @@ def test_duplicate_quarantine_closes_without_dispatching_workload(tmp_path: Path
     assert provider.resources == {}
 
 
+def test_unresolved_create_dispatch_closes_without_dispatching_workload(tmp_path: Path) -> None:
+    clock_value = datetime(2026, 7, 31, tzinfo=UTC)
+    store = RunStore(tmp_path / "runs")
+    provider = MemoryRunPod()
+    controller = LifecycleController(
+        store,
+        provider,
+        now=lambda: clock_value,
+        provision_visibility_grace_seconds=5,
+    )
+    controller.plan("run-unresolved", {"job": "noop"}, approved_max_usd="0.50")
+    controller.reconcile("run-unresolved")
+
+    def crash_before_create(_kind: str, _operation_id: str) -> None:
+        raise SystemExit("simulated controller death")
+
+    provider.before_effect = crash_before_create
+    with pytest.raises(SystemExit, match="controller death"):
+        controller.reconcile("run-unresolved")
+    provider.before_effect = None
+    clock_value += timedelta(seconds=6)
+    recovering = controller.reconcile("run-unresolved")
+    assert recovering["recovery_reason"] == "provision_dispatch_unresolved"
+    with store.transaction("run-unresolved") as transaction:
+        state = transaction.current_state()
+        state["closeout"]["provision_absence_first_observed_at"] = (
+            datetime.now(UTC) - timedelta(seconds=10)
+        ).isoformat()
+        transaction.commit_state("aged_absence_fixture", state)
+    executor = RecordingExecutor()
+
+    closed = SupervisorEngine(store, provider, executor).drive("run-unresolved")
+
+    assert executor.calls == 0
+    assert closed["lifecycle"] == LifecycleState.CLOSED
+    assert closed["workload_result"] == WorkloadResult.CANCELLED
+    assert provider.effects == []
+
+
 def test_local_failed_phase_still_deletes_and_closes(tmp_path: Path) -> None:
     bundle = make_bundle(tmp_path / "bundle", fail=True)
     store = RunStore(tmp_path / "runs")
@@ -295,9 +489,137 @@ def test_local_failed_phase_still_deletes_and_closes(tmp_path: Path) -> None:
     run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
     provider = MemoryRunPod()
 
-    state = SupervisorEngine(store, provider, LocalRunnerExecutor()).drive(run_id)
+    state = SupervisorEngine(
+        store,
+        provider,
+        LocalRunnerExecutor(runner_identity=TEST_IDENTITY),
+    ).drive(run_id)
 
     assert state["lifecycle"] == LifecycleState.CLOSED
     assert state["workload_result"] == "failed"
     assert state["closeout"]["artifact_disposition"]["status"] == "unavailable"
+    assert provider.resources == {}
+
+
+def test_partial_incremental_recovery_still_deletes_and_closes(tmp_path: Path) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-partial",
+    )
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+    provider = MemoryRunPod()
+
+    class PartialFailureExecutor:
+        calls = 0
+
+        def execute(
+            self, request: Mapping[str, object], run_dir: Path
+        ) -> ExecutionObservation:
+            del request, run_dir
+            self.calls += 1
+            return ExecutionObservation(
+                result=WorkloadResult.FAILED,
+                disposition=ArtifactDisposition.PARTIAL_RECOVERED,
+                detail="incremental artifact contract failed after one verified checkpoint",
+            )
+
+    executor = PartialFailureExecutor()
+    state = SupervisorEngine(store, provider, executor).drive(run_id)
+
+    assert executor.calls == 1
+    assert state["lifecycle"] == LifecycleState.CLOSED
+    assert state["workload_result"] == WorkloadResult.FAILED
+    assert state["closeout"]["artifact_disposition"]["status"] == (
+        ArtifactDisposition.PARTIAL_RECOVERED
+    )
+    assert state["closeout"]["delete_acknowledged"] is True
+    assert provider.resources == {}
+
+
+def test_permanent_authenticated_status_failure_deletes_and_closes_once(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-status-rejected",
+    )
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+    provider = MemoryRunPod()
+
+    class RejectedStatusExecutor:
+        calls = 0
+
+        def execute(
+            self, request: Mapping[str, object], run_dir: Path
+        ) -> ExecutionObservation:
+            del request, run_dir
+            self.calls += 1
+            return ExecutionObservation(
+                result=WorkloadResult.FAILED,
+                disposition=ArtifactDisposition.UNAVAILABLE,
+                detail=(
+                    "authenticated remote status is invalid: "
+                    "remote status token was rejected"
+                ),
+            )
+
+    executor = RejectedStatusExecutor()
+
+    state = SupervisorEngine(store, provider, executor).drive(run_id)
+
+    assert executor.calls == 1
+    assert state["lifecycle"] == LifecycleState.CLOSED
+    assert state["workload_result"] == WorkloadResult.FAILED
+    assert state["closeout"]["artifact_disposition"]["status"] == (
+        ArtifactDisposition.UNAVAILABLE
+    )
+    assert [effect.kind for effect in provider.effects].count("delete") == 1
+    assert provider.resources == {}
+
+
+def test_terminal_artifact_contract_failure_still_deletes_and_closes(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-terminal-artifact-failure",
+    )
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+    provider = MemoryRunPod()
+
+    class TerminalArtifactFailureExecutor:
+        def execute(
+            self, request: Mapping[str, object], run_dir: Path
+        ) -> ExecutionObservation:
+            del request, run_dir
+            return ExecutionObservation(
+                result=WorkloadResult.FAILED,
+                disposition=ArtifactDisposition.UNAVAILABLE,
+                detail="terminal artifact recovery failed: manifest is invalid JSON",
+            )
+
+    state = SupervisorEngine(
+        store,
+        provider,
+        TerminalArtifactFailureExecutor(),
+    ).drive(run_id)
+
+    assert state["lifecycle"] == LifecycleState.CLOSED
+    assert state["workload_result"] == WorkloadResult.FAILED
+    assert state["closeout"]["artifact_disposition"]["status"] == (
+        ArtifactDisposition.UNAVAILABLE
+    )
+    assert state["closeout"]["delete_acknowledged"] is True
     assert provider.resources == {}

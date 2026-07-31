@@ -69,7 +69,13 @@
             "artifact_manifest_invalid",
             "artifact_file_missing",
             "artifact_size_mismatch",
-            "artifact_hash_mismatch"
+            "artifact_hash_mismatch",
+            "runner_version_mismatch",
+            "runner_git_commit_mismatch",
+            "runner_identity_unavailable",
+            "unsupported_protocol_major",
+            "launch_authorization_invalid",
+            "launch_authorization_timeout"
           ]
         },
         "phase": {"$ref": "#/$defs/phase"},
@@ -101,6 +107,9 @@
     "remote-status": {
       "type": "object",
       "required": [
+        "runner_version",
+        "runner_git_commit",
+        "supported_protocol_majors",
         "state",
         "phase",
         "heartbeat_monotonic_seconds",
@@ -109,6 +118,32 @@
         "terminal_result"
       ],
       "properties": {
+        "runner_version": {
+          "type": "string",
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "runner_git_commit": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "supported_protocol_majors": {
+          "type": "object",
+          "required": [
+            "artifact-manifest",
+            "launch-authorization",
+            "run-event",
+            "run-request",
+            "run-status"
+          ],
+          "properties": {
+            "artifact-manifest": {"$ref": "#/$defs/protocol-major-array"},
+            "launch-authorization": {"$ref": "#/$defs/protocol-major-array"},
+            "run-event": {"$ref": "#/$defs/protocol-major-array"},
+            "run-request": {"$ref": "#/$defs/protocol-major-array"},
+            "run-status": {"$ref": "#/$defs/protocol-major-array"}
+          },
+          "additionalProperties": {"$ref": "#/$defs/protocol-major-array"}
+        },
         "state": {"enum": ["ready", "running", "terminal"]},
         "phase": {"$ref": "#/$defs/phase"},
         "heartbeat_sequence": {"type": "integer", "minimum": 0},
@@ -132,6 +167,12 @@
           "else": {"properties": {"terminal_result": {"type": "null"}}}
         }
       ]
+    },
+    "protocol-major-array": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "minItems": 1,
+      "uniqueItems": true
     },
     "artifact-disposition": {
       "type": "object",

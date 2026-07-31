@@ -4,9 +4,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+from runpod_jobrunner import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTAINER = ROOT / "container"
@@ -43,12 +47,15 @@ def test_image_copies_only_declared_source_and_never_bakes_credentials() -> None
     assert set(dockerignore[1:]) == {
         "!pyproject.toml",
         "!README.md",
+        "!LICENSE",
         "!src",
         "!src/**",
         "!container",
         "!container/Dockerfile",
         "!container/entrypoint.sh",
         "!container/noop.py",
+        "!container/release-receipt.py",
+        "!container/requirements-runtime.lock",
     }
 
 
@@ -65,6 +72,40 @@ def test_entrypoint_preserves_ssh_bootstrap_and_has_a_bounded_request_wait() -> 
     assert "/workspace/runpod-jobrunner/status-token" in entrypoint
     assert "--status-port 8080" in entrypoint
     assert "sh -c" not in entrypoint
+    assert "RUNPOD_JOBRUNNER_RELEASE_PATH=/opt/runpod-jobrunner/release.json" in entrypoint
+
+
+def test_image_embeds_a_full_build_identity_receipt(tmp_path: Path) -> None:
+    dockerfile = (CONTAINER / "Dockerfile").read_text()
+    assert "install -m 0444 LICENSE /opt/runpod-jobrunner/LICENSE" in dockerfile
+    assert 'org.opencontainers.image.version="${RUNNER_VERSION}"' in dockerfile
+
+    output = tmp_path / "release.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(CONTAINER / "release-receipt.py"),
+            str(output),
+            __version__,
+            "a" * 40,
+        ],
+        check=True,
+    )
+
+    assert json.loads(output.read_text()) == {
+        "protocol": "runner-release/1",
+        "runner_version": __version__,
+        "runner_git_commit": "a" * 40,
+        "supported_protocol_majors": {
+            "artifact-manifest": [1],
+            "incremental-mirror-ack": [1],
+            "launch-authorization": [1],
+            "run-event": [1],
+            "run-request": [1],
+            "run-status": [1],
+        },
+    }
+    assert output.stat().st_mode & 0o777 == 0o444
 
 
 def test_noop_package_phase_creates_a_small_content_verified_manifest(
@@ -145,3 +186,60 @@ def test_publish_workflow_and_script_never_use_floating_action_or_image_tags() -
     assert ":latest" not in publish_script
     assert "docker buildx build" in publish_script
     assert "docker buildx imagetools inspect" in publish_script
+    assert "git status --porcelain=v1 --untracked-files=all" in publish_script
+    assert '--build-arg "SOURCE_REVISION=${source_revision}"' in publish_script
+    assert '--build-arg "RUNNER_VERSION=${version}"' in publish_script
+    assert "--require-hashes -r container/requirements-ci.lock" in workflow
+    assert "uv export --frozen" in workflow
+    dockerfile = (CONTAINER / "Dockerfile").read_text()
+    assert "--require-hashes -r requirements-runtime.lock" in dockerfile
+    assert "--no-deps --no-build-isolation ." in dockerfile
+
+
+def _publish_script_repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "repository"
+    (repository / "container").mkdir(parents=True)
+    shutil.copy2(ROOT / "pyproject.toml", repository / "pyproject.toml")
+    shutil.copy2(
+        CONTAINER / "build-publish.sh",
+        repository / "container" / "build-publish.sh",
+    )
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Container Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "fixture"],
+        check=True,
+    )
+    return repository
+
+
+def test_publish_script_rejects_dirty_source_and_version_mismatch(tmp_path: Path) -> None:
+    repository = _publish_script_repository(tmp_path)
+    script = repository / "container" / "build-publish.sh"
+
+    mismatch = subprocess.run(
+        [str(script), "example.invalid/runner", "9.9.9"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatch.returncode == 65
+    assert "differs from project version" in mismatch.stderr
+
+    (repository / "uncommitted.txt").write_text("dirty\n")
+    dirty = subprocess.run(
+        [str(script), "example.invalid/runner", __version__],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+    )
+    assert dirty.returncode == 65
+    assert "dirty build tree" in dirty.stderr

@@ -8,6 +8,10 @@
     "run_id",
     "bundle_hash",
     "image_digest",
+    "runner_version",
+    "runner_git_commit",
+    "supported_protocol_majors",
+    "launch_authorization",
     "phases",
     "limits",
     "heartbeat_interval_seconds",
@@ -22,8 +26,16 @@
       "type": "string",
       "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$"
     },
-    "runner_version": {"type": "string", "minLength": 1},
-    "runner_git_commit": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+    "runner_version": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "runner_git_commit": {
+      "type": "string",
+      "pattern": "^(?!(?:0{40}|0{64})$)(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "supported_protocol_majors": {"$ref": "#/$defs/supported-protocol-majors"},
+    "launch_authorization": {"$ref": "#/$defs/launch-authorization"},
     "phases": {
       "type": "object",
       "required": ["verify", "preflight", "train", "evaluate", "package"],
@@ -59,6 +71,18 @@
       "additionalProperties": true
     },
     "artifact_manifest_path": {"$ref": "#/$defs/safe-relative-path"}
+    ,
+    "incremental_mirror_ack": {
+      "type": "object",
+      "required": ["protocol", "directory", "timeout_seconds", "signer"],
+      "properties": {
+        "protocol": {"const": "incremental-mirror-ack/1"},
+        "directory": {"$ref": "#/$defs/safe-relative-path"},
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+        "signer": {"$ref": "#/$defs/ack-signer"}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": true,
   "$defs": {
@@ -74,6 +98,59 @@
     "safe-relative-path": {
       "type": "string",
       "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?=.+[^/])[^\\u0000]+$"
+    },
+    "supported-protocol-majors": {
+      "type": "object",
+      "required": [
+        "artifact-manifest",
+        "launch-authorization",
+        "run-event",
+        "run-request",
+        "run-status"
+      ],
+      "properties": {
+        "artifact-manifest": {"$ref": "#/$defs/protocol-major-array"},
+        "incremental-mirror-ack": {"$ref": "#/$defs/protocol-major-array"},
+        "launch-authorization": {"$ref": "#/$defs/protocol-major-array"},
+        "run-event": {"$ref": "#/$defs/protocol-major-array"},
+        "run-request": {"$ref": "#/$defs/protocol-major-array"},
+        "run-status": {"$ref": "#/$defs/protocol-major-array"}
+      },
+      "additionalProperties": {"$ref": "#/$defs/protocol-major-array"}
+    },
+    "protocol-major-array": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "launch-authorization": {
+      "type": "object",
+      "required": ["protocol", "path", "sha256", "size", "timeout_seconds"],
+      "properties": {
+        "protocol": {"const": "launch-authorization/1"},
+        "path": {"const": "control/launch-authorization.token"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 4096},
+        "timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3600
+        }
+      },
+      "additionalProperties": false
+    },
+    "ack-signer": {
+      "type": "object",
+      "required": ["algorithm", "identity", "key_id", "namespace", "public_key"],
+      "properties": {
+        "algorithm": {"const": "ssh-ed25519"},
+        "identity": {"type": "string", "pattern": "^runpod-jobrunner:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "key_id": {"type": "string", "pattern": "^SHA256:[A-Za-z0-9+/]+$"},
+        "namespace": {"const": "runpod-jobrunner-incremental-mirror"},
+        "public_key": {"type": "string", "pattern": "^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$"}
+      },
+      "additionalProperties": false
     },
     "phase": {
       "type": "object",

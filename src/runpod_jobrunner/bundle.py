@@ -23,6 +23,7 @@ import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, ScalarNode
 
+from runpod_jobrunner.identity import supported_protocol_majors
 from runpod_jobrunner.protocol import (
     CanonicalJSONError,
     ProtocolValidationError,
@@ -150,6 +151,7 @@ class JobBundle:
     bundle_hash: str
     image_digest: str
     runner_version: str
+    runner_git_commit: str
     phases: tuple[PhaseSpec, ...]
     storage: StorageSpec
     input_root: Path
@@ -195,6 +197,8 @@ class JobBundle:
             "bundle_hash": self.bundle_hash,
             "image_digest": self.image_digest,
             "runner_version": self.runner_version,
+            "runner_git_commit": self.runner_git_commit,
+            "supported_protocol_majors": supported_protocol_majors(),
             "phases": {
                 phase.name: {
                     "enabled": phase.enabled,
@@ -305,6 +309,30 @@ def _safe_relative_path(raw_path: object, *, field_name: str) -> PurePosixPath:
     ):
         _bundle_error(f"{field_name} must be a normalized relative path without '.' or '..'")
     return path
+
+
+def _safe_incremental_manifest_glob(raw_value: object) -> str:
+    field_name = "artifacts.incremental_manifest_glob"
+    if not isinstance(raw_value, str) or not raw_value or len(raw_value) > 512:
+        _bundle_error(f"{field_name} must be a non-empty string of at most 512 characters")
+    if "**" in raw_value or any(character in raw_value for character in "?[]{}\\\x00"):
+        _bundle_error(f"{field_name} contains unsupported glob metacharacters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw_value):
+        _bundle_error(f"{field_name} contains control characters")
+    path = PurePosixPath(raw_value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != raw_value
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "*" in path.name
+        or len(path.parts) > 32
+        or sum(part.count("*") for part in path.parts) > 4
+    ):
+        _bundle_error(
+            f"{field_name} must be a normalized relative fixed glob with a fixed filename"
+        )
+    return raw_value
 
 
 def _reject_symlink_components(root: Path, relative_path: PurePosixPath, *, label: str) -> Path:
@@ -464,6 +492,31 @@ def check_bundle(bundle_root: str | os.PathLike[str]) -> JobBundle:
     except ProtocolValidationError as exc:
         raise BundleValidationError(str(exc)) from exc
 
+    artifacts_value = spec.get("artifacts")
+    if isinstance(artifacts_value, Mapping):
+        artifacts_mapping = cast(Mapping[str, object], artifacts_value)
+        incremental_glob = artifacts_mapping.get("incremental_manifest_glob")
+        if incremental_glob is not None:
+            _safe_incremental_manifest_glob(incremental_glob)
+        incremental_ack = artifacts_mapping.get("incremental_mirror_ack")
+        if incremental_ack is not None:
+            if incremental_glob is None or not isinstance(incremental_ack, Mapping):
+                _bundle_error(
+                    "artifacts.incremental_mirror_ack requires an incremental manifest glob"
+                )
+            ack_mapping = cast(Mapping[str, object], incremental_ack)
+            directory = _safe_relative_path(
+                ack_mapping.get("directory"),
+                field_name="artifacts.incremental_mirror_ack.directory",
+            )
+            if any(
+                ord(character) < 32 or ord(character) == 127
+                for character in directory.as_posix()
+            ):
+                _bundle_error(
+                    "artifacts.incremental_mirror_ack.directory contains control characters"
+                )
+
     try:
         actual_bundle_hash = compute_bundle_hash(spec, manifest)
         job_spec_json = canonical_json(spec)
@@ -494,6 +547,7 @@ def check_bundle(bundle_root: str | os.PathLike[str]) -> JobBundle:
         bundle_hash=actual_bundle_hash,
         image_digest=spec["image"],
         runner_version=spec["runner"]["version"],
+        runner_git_commit=spec["runner"]["git_commit"],
         phases=phases,
         storage=StorageSpec(
             encrypted=storage["encrypted"],

@@ -19,10 +19,23 @@ jobs:
       - name: Check out the release revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Verify the container contract
+      - name: Verify the release
         run: |
-          python3 -m pip install --disable-pip-version-check '.[dev]'
-          python3 -m pytest -q tests/test_container_contract.py
+          python3 -m pip install --disable-pip-version-check \
+            --require-hashes -r container/requirements-ci.lock
+          python3 -m pip install --disable-pip-version-check \
+            --no-deps --no-build-isolation .
+          uv export --frozen --no-header --no-dev --group build --no-emit-project \
+            --output-file /tmp/requirements-runtime.lock
+          cmp container/requirements-runtime.lock /tmp/requirements-runtime.lock
+          uv export --frozen --no-header --no-dev --extra dev --group build --group ci-tools \
+            --no-emit-project --output-file /tmp/requirements-ci.lock
+          cmp container/requirements-ci.lock /tmp/requirements-ci.lock
+          python3 -m ruff check src tests
+          pyright
+          python3 -m pytest -q
+          python3 -m pip wheel --disable-pip-version-check \
+            --no-deps --no-build-isolation --wheel-dir /tmp/wheels .
 
       - name: Create an attestation-capable BuildKit builder
         run: |

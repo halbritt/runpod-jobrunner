@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -24,6 +24,7 @@ from runpod_jobrunner.provider import (
 from runpod_jobrunner.run_store import RunStore, RunTransaction
 
 _OPERATION_NAMESPACE = uuid.UUID("c2ad7d61-943e-42c8-9353-b864fd25f7f0")
+_PROVISION_VISIBILITY_GRACE_SECONDS = 30.0
 
 
 class LifecycleState(StrEnum):
@@ -64,9 +65,20 @@ class InvalidTransitionError(LifecycleError):
 class LifecycleController:
     """Advance one run by one durable reconciliation step per call."""
 
-    def __init__(self, store: RunStore, provider: Provider) -> None:
+    def __init__(
+        self,
+        store: RunStore,
+        provider: Provider,
+        *,
+        now: Callable[[], datetime] | None = None,
+        provision_visibility_grace_seconds: float = _PROVISION_VISIBILITY_GRACE_SECONDS,
+    ) -> None:
+        if provision_visibility_grace_seconds <= 0:
+            raise ValueError("provision visibility grace must be positive")
         self.store = store
         self.provider = provider
+        self._now = now or (lambda: datetime.now(UTC))
+        self._provision_visibility_grace_seconds = provision_visibility_grace_seconds
 
     def plan(
         self,
@@ -249,6 +261,12 @@ class LifecycleController:
         if matches:
             return self._record_provisioned(transaction, state, matches[0])
 
+        operation_status = _string(operation, "status")
+        if operation_status != "intended":
+            return self._record_provision_visibility_pending(
+                transaction, state, operation, operation_id
+            )
+
         request = self.store.read_request(state["run_id"])
         provider_spec = request.get("provider", {})
         if not isinstance(provider_spec, dict):
@@ -260,6 +278,13 @@ class LifecycleController:
             spec=cast(dict[str, object], provider_spec),
         )
         operation["attempts"] = _integer(operation.get("attempts", 0)) + 1
+        operation["status"] = "dispatched"
+        operation["dispatched_at"] = self._now().isoformat()
+        transaction.commit_state(
+            "provider_operation_dispatched",
+            state,
+            {"kind": "provision", "operation_id": operation_id},
+        )
         try:
             resource = self.provider.create(create_request)
         except ProviderRejected as error:
@@ -278,6 +303,60 @@ class LifecycleController:
         except ProviderError as error:
             self._record_provider_error(transaction, state, operation, "provision", error)
         return self._record_provisioned(transaction, state, resource)
+
+    def _record_provision_visibility_pending(
+        self,
+        transaction: RunTransaction,
+        state: dict[str, Any],
+        operation: dict[str, Any],
+        operation_id: str,
+    ) -> dict[str, Any]:
+        """Observe a dispatched create without ever issuing it a second time."""
+
+        now = self._now()
+        first_value = operation.get("dispatched_at") or operation.get(
+            "visibility_first_observed_at"
+        )
+        if not isinstance(first_value, str):
+            first_value = now.isoformat()
+            operation["visibility_first_observed_at"] = first_value
+        try:
+            first = datetime.fromisoformat(first_value)
+        except ValueError:
+            raise LifecycleConflictError("provision dispatch timestamp is invalid") from None
+        if first.tzinfo is None or now.tzinfo is None:
+            raise LifecycleConflictError("provision dispatch timestamp must be timezone-aware")
+        elapsed = (now - first).total_seconds()
+        if elapsed < 0:
+            raise LifecycleConflictError("provision dispatch timestamp is in the future")
+        operation["visibility_observations"] = (
+            _integer(operation.get("visibility_observations", 0)) + 1
+        )
+        operation["last_visibility_observed_at"] = now.isoformat()
+        if elapsed < self._provision_visibility_grace_seconds:
+            return transaction.commit_state(
+                "provider_resource_visibility_pending",
+                state,
+                {"operation_id": operation_id, "elapsed_seconds": elapsed},
+            )
+
+        detail = "provider create was dispatched but its exact resource did not become visible"
+        operation["status"] = "unresolved"
+        state["recovery_reason"] = "provision_dispatch_unresolved"
+        state["workload_result"] = WorkloadResult.CANCELLED
+        closeout = _object(state, "closeout")
+        closeout["artifact_disposition"] = {
+            "status": ArtifactDisposition.UNAVAILABLE,
+            "detail": detail,
+        }
+        operations = _object(state, "operations")
+        operations.setdefault("delete", _new_operation(state["run_id"], "delete"))
+        state["lifecycle"] = LifecycleState.RECOVERING
+        return transaction.commit_state(
+            "provider_create_visibility_exhausted",
+            state,
+            {"operation_id": operation_id, "elapsed_seconds": elapsed},
+        )
 
     def _record_provisioned(
         self,
@@ -407,7 +486,7 @@ class LifecycleController:
                         state,
                         {"resource_id": matches[0].id},
                     )
-                now = datetime.now(UTC)
+                now = self._now()
                 first_value = closeout.get("provision_absence_first_observed_at")
                 if not isinstance(first_value, str):
                     closeout["provision_absence_first_observed_at"] = now.isoformat()

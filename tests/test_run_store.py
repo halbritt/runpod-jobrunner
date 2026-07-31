@@ -97,11 +97,41 @@ def test_run_lock_serializes_transactions(tmp_path: Path) -> None:
     assert acquired.is_set()
 
 
-def test_corrupt_event_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fragment", [b'{"sequence":', b'{"exit_code":-'])
+def test_torn_final_event_is_truncated_and_sequence_resumes(
+    tmp_path: Path, fragment: bytes
+) -> None:
+    store = RunStore(tmp_path / "runs")
+    store.create_run("run-1", {"job": "noop"}, {"run_id": "run-1"})
+    journal = store.paths("run-1").events
+    durable_prefix = journal.read_bytes()
+    with store.paths("run-1").events.open("ab") as events:
+        events.write(fragment)
+
+    assert store.read_state("run-1")["event_sequence"] == 1
+    assert journal.read_bytes() == durable_prefix
+
+    with store.transaction("run-1") as transaction:
+        transaction.commit_state("resumed", {"run_id": "run-1"})
+
+    assert [event["sequence"] for event in store.read_events("run-1")] == [1, 2]
+
+
+def test_complete_malformed_event_record_fails_closed(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs")
     store.create_run("run-1", {"job": "noop"}, {"run_id": "run-1"})
     with store.paths("run-1").events.open("ab") as events:
-        events.write(b'{"sequence":')
+        events.write(b'{"sequence":}\n')
+
+    with pytest.raises(ValueError, match="corrupt event journal"):
+        store.read_state("run-1")
+
+
+def test_nonterminated_but_complete_malformed_event_fails_closed(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    store.create_run("run-1", {"job": "noop"}, {"run_id": "run-1"})
+    with store.paths("run-1").events.open("ab") as events:
+        events.write(b'{"sequence":}')
 
     with pytest.raises(ValueError, match="corrupt event journal"):
         store.read_state("run-1")

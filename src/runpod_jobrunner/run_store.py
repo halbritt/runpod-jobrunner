@@ -117,10 +117,11 @@ class RunStore:
         """Read the effective projection, including a journal entry newer than state.json."""
 
         paths = self.paths(run_id)
-        state = _effective_state(paths)
-        if state.get("lifecycle") == "closed":
-            _ensure_closeout_receipt(paths, state)
-        return state
+        with _read_lock(paths):
+            state = _effective_state(paths)
+            if state.get("lifecycle") == "closed":
+                _ensure_closeout_receipt(paths, state)
+            return state
 
     def read_closeout_receipt(self, run_id: str) -> dict[str, Any]:
         """Read and validate the durable receipt for a terminal closed run."""
@@ -131,7 +132,9 @@ class RunStore:
         return _read_and_validate_closeout_receipt(self.paths(run_id).closeout_receipt)
 
     def read_events(self, run_id: str) -> list[dict[str, Any]]:
-        return _read_events(self.paths(run_id).events)
+        paths = self.paths(run_id)
+        with _read_lock(paths):
+            return _read_events(paths.events)
 
     def active_run_ids(self) -> tuple[str, ...]:
         if not self.runs_root.exists():
@@ -215,6 +218,22 @@ class RunTransaction:
 
 def _ensure_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+@contextmanager
+def _read_lock(paths: RunPaths) -> Generator[None, None, None]:
+    """Exclude appenders while a reader may repair a torn journal tail."""
+
+    if not paths.directory.exists():
+        yield
+        return
+    descriptor = os.open(paths.lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _json_bytes(value: Mapping[str, object]) -> bytes:
@@ -318,11 +337,20 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
         return []
     events: list[dict[str, Any]] = []
     try:
-        journal = path.read_text()
+        journal_bytes = path.read_bytes()
     except OSError as error:
         raise ValueError(f"cannot read event journal: {path}") from error
-    if journal and not journal.endswith("\n"):
-        raise ValueError(f"corrupt event journal: {path}")
+    if journal_bytes and not journal_bytes.endswith(b"\n"):
+        final_record_offset = journal_bytes.rfind(b"\n") + 1
+        fragment = journal_bytes[final_record_offset:]
+        if not _is_torn_json_fragment(fragment):
+            raise ValueError(f"corrupt event journal: {path}")
+        _truncate_and_sync(path, final_record_offset)
+        journal_bytes = journal_bytes[:final_record_offset]
+    try:
+        journal = journal_bytes.decode()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"corrupt event journal: {path}") from error
     lines = journal.splitlines()
     for expected_sequence, line in enumerate(lines, start=1):
         try:
@@ -342,6 +370,48 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"corrupt event journal projection: {path}")
         events.append(event)
     return events
+
+
+def _is_torn_json_fragment(fragment: bytes) -> bool:
+    """Return true only when a non-terminated final JSON value ends mid-token."""
+
+    try:
+        text = fragment.decode()
+    except UnicodeDecodeError as error:
+        return error.end == len(fragment) and error.reason == "unexpected end of data"
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as error:
+        if error.pos == len(text) or error.msg.startswith("Unterminated string"):
+            return True
+        suffix = text[error.pos:]
+        if error.msg == "Expecting value" and (
+            suffix == "-"
+            or any(literal.startswith(suffix) for literal in ("true", "false", "null"))
+        ):
+            return True
+        if error.msg == "Invalid \\uXXXX escape" and suffix.startswith("u"):
+            return len(suffix) < 5
+        return error.msg == "Expecting ',' delimiter" and suffix in {
+            ".",
+            "e",
+            "E",
+            "e+",
+            "e-",
+            "E+",
+            "E-",
+        }
+    return False
+
+
+def _truncate_and_sync(path: Path, length: int) -> None:
+    descriptor = os.open(path, os.O_WRONLY)
+    try:
+        os.ftruncate(descriptor, length)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
 
 
 def _effective_state(paths: RunPaths) -> dict[str, Any]:
