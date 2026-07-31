@@ -97,6 +97,8 @@ def test_create_uses_encryption_key_and_provider_termination() -> None:
     assert values["volumeKey"] == "a1" * 15
     assert values["terminateAfter"] == "2026-08-01T00:00:00Z"
     assert values["cloudType"] == "SECURE"
+    assert "publicIp" not in sent["query"]
+    assert "portMappings" not in sent["query"]
     assert opener.requests[0].get_header("Authorization") is None
     assert opener.requests[0].get_header("User-agent") == f"runpod-jobrunner/{__version__}"
     assert parse_qs(urlsplit(str(opener.requests[0].full_url)).query) == {
@@ -225,6 +227,32 @@ def test_create_maps_http_500_to_unknown_without_leaking_api_key() -> None:
     api = RunPodHTTP("very-secret", opener=FailingOpener())
 
     with pytest.raises(RunPodTransportOutcomeUnknown) as caught:
+        api.create_encrypted_pod(create_request(), volume_key="z" * 30)
+
+    assert "very-secret" not in str(caught.value)
+
+
+def test_create_classifies_http_400_validation_without_leaking_remote_message() -> None:
+    class FailingOpener:
+        def open(self, request: Any, timeout: float) -> Response:
+            del timeout
+            body = json.dumps(
+                {
+                    "errors": [
+                        {
+                            "message": f"rejected {request.full_url}",
+                            "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+                        }
+                    ]
+                }
+            ).encode()
+            raise HTTPError(request.full_url, 400, "bad request", Message(), io.BytesIO(body))
+
+    api = RunPodHTTP("very-secret", opener=FailingOpener())
+
+    with pytest.raises(
+        RunPodTransportOutcomeUnknown, match="GraphQL validation failed"
+    ) as caught:
         api.create_encrypted_pod(create_request(), volume_key="z" * 30)
 
     assert "very-secret" not in str(caught.value)

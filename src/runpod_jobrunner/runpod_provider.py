@@ -132,7 +132,7 @@ class RunPodHTTP:
           mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
             podFindAndDeployOnDemand(input: $input) {
               id name imageName desiredStatus costPerHr volumeEncrypted env
-              publicIp portMappings volumeInGb volumeMountPath
+              volumeInGb volumeMountPath
               machine { dataCenterId secureCloud gpuTypeId currentPricePerGpu }
             }
           }
@@ -255,7 +255,14 @@ class RunPodHTTP:
         except HTTPError as error:
             if allow_not_found and error.code == 404:
                 return None
-            raise ProviderProtocolError(f"RunPod HTTP error {error.code}") from None
+            suffix = ""
+            if not include_authorization_header:
+                try:
+                    error_body = error.read(65537)
+                except (AttributeError, OSError):
+                    error_body = b""
+                suffix = _graphql_http_error_suffix(error_body)
+            raise ProviderProtocolError(f"RunPod HTTP error {error.code}{suffix}") from None
         except (URLError, TimeoutError, OSError) as error:
             raise RunPodTransportOutcomeUnknown(
                 f"RunPod transport outcome unknown ({type(error).__name__})"
@@ -266,6 +273,29 @@ class RunPodHTTP:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ProviderProtocolError("RunPod returned invalid JSON") from None
+
+
+def _graphql_http_error_suffix(raw: bytes) -> str:
+    if not raw or len(raw) > 65536:
+        return ""
+    try:
+        value: object = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(value, Mapping):
+        return ""
+    errors = cast(Mapping[str, object], value).get("errors")
+    if not isinstance(errors, Sequence) or isinstance(errors, (str, bytes, bytearray)):
+        return ""
+    for item in cast(Sequence[object], errors):
+        if not isinstance(item, Mapping):
+            continue
+        extensions = cast(Mapping[str, object], item).get("extensions")
+        if isinstance(extensions, Mapping) and cast(Mapping[str, object], extensions).get(
+            "code"
+        ) == "GRAPHQL_VALIDATION_FAILED":
+            return " (GraphQL validation failed)"
+    return ""
 
 
 def _parse_pod(raw: Mapping[str, Any]) -> PodObservation:
