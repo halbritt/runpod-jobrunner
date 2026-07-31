@@ -167,11 +167,12 @@ class RunPodHTTP:
         raw = self._json_request("GET", REST_PODS_URL)
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
             raise ProviderProtocolError("RunPod pod list was not an array")
-        return tuple(
-            _parse_pod(cast(Mapping[str, Any], item))
-            for item in cast(Sequence[object], raw)
-            if isinstance(item, Mapping)
-        )
+        observations: list[PodObservation] = []
+        for item in cast(Sequence[object], raw):
+            if not isinstance(item, Mapping):
+                raise ProviderProtocolError("RunPod pod list item was not an object")
+            observations.append(_parse_pod(cast(Mapping[str, Any], item)))
+        return tuple(observations)
 
     def get_pod(self, pod_id: str) -> PodObservation | None:
         raw = self._json_request("GET", f"{REST_PODS_URL}/{pod_id}", allow_not_found=True)

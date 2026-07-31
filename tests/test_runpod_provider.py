@@ -199,6 +199,14 @@ def test_exact_name_reconciliation_and_spend() -> None:
     assert str(api.current_spend_per_hour()) == "0.24"
 
 
+@pytest.mark.parametrize("malformed_item", [None, "pod-1", 7, []])
+def test_list_pods_rejects_non_object_members(malformed_item: object) -> None:
+    api = RunPodHTTP("secret", opener=RecordingOpener([[malformed_item]]))
+
+    with pytest.raises(ProviderProtocolError, match="pod list item was not an object"):
+        api.list_pods()
+
+
 def test_get_404_is_absent() -> None:
     class MissingOpener:
         def open(self, request: Any, timeout: float) -> Response:
