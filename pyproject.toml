@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Recoverable, bounded RunPod jobs with a fixed execution protocol"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 dependencies = [
   "jsonschema>=4.23,<5",
   "PyYAML>=6.0,<7",
@@ -52,4 +52,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
-

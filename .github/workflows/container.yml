@@ -1,0 +1,39 @@
+name: container
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact semantic version to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-noop-runner:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the release revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify the container contract
+        run: |
+          python3 -m pip install --disable-pip-version-check '.[dev]'
+          python3 -m pytest -q tests/test_container_contract.py
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and publish the exact version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          container/build-publish.sh --push \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER}/runpod-jobrunner-noop" \
+            "${VERSION}"

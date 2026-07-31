@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "usage: container/build-publish.sh [--push] IMAGE VERSION" >&2
+}
+
+publish=false
+if [[ "${1:-}" == "--push" ]]; then
+    publish=true
+    shift
+fi
+if (( $# != 2 )); then
+    usage
+    exit 64
+fi
+
+readonly image="${1,,}"
+readonly version="${2#v}"
+if [[ ! "${image}" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+    echo "IMAGE is not a normalized registry path" >&2
+    exit 64
+fi
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "VERSION must be an exact semantic version" >&2
+    exit 64
+fi
+
+readonly source_revision="$(git rev-parse --verify HEAD)"
+readonly short_revision="${source_revision:0:12}"
+readonly source_date_epoch="$(git show -s --format=%ct "${source_revision}")"
+readonly source_created="$(git show -s --format=%cI "${source_revision}")"
+readonly repository_url="$(git config --get remote.origin.url || true)"
+
+output=(--load)
+if [[ "${publish}" == true ]]; then
+    output=(--push --provenance=mode=max --sbom=true)
+fi
+
+docker buildx build \
+    --platform linux/amd64 \
+    --file container/Dockerfile \
+    --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+    --label "org.opencontainers.image.created=${source_created}" \
+    --label "org.opencontainers.image.revision=${source_revision}" \
+    --label "org.opencontainers.image.source=${repository_url}" \
+    --tag "${image}:${version}" \
+    --tag "${image}:sha-${short_revision}" \
+    "${output[@]}" \
+    .
+
+if [[ "${publish}" == true ]]; then
+    docker buildx imagetools inspect "${image}:${version}"
+else
+    docker image inspect "${image}:${version}" --format '{{json .RepoDigests}}'
+fi
