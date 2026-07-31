@@ -448,7 +448,14 @@ def test_unresolved_create_dispatch_closes_without_dispatching_workload(tmp_path
         now=lambda: clock_value,
         provision_visibility_grace_seconds=5,
     )
-    controller.plan("run-unresolved", {"job": "noop"}, approved_max_usd="0.50")
+    controller.plan(
+        "run-unresolved",
+        {
+            "job": "noop",
+            "provider": {"terminate_at": "2026-07-31T00:00:00Z"},
+        },
+        approved_max_usd="0.50",
+    )
     controller.reconcile("run-unresolved")
 
     def crash_before_create(_kind: str, _operation_id: str) -> None:

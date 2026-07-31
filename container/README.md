@@ -20,14 +20,14 @@ docker buildx imagetools inspect runpod/base:1.1.0-ubuntu2404
 Build an exact version from a committed source revision:
 
 ```console
-container/build-publish.sh ghcr.io/halbritt/runpod-jobrunner-noop 0.1.1
+container/build-publish.sh ghcr.io/halbritt/runpod-jobrunner-noop 0.1.2
 ```
 
 Publishing is an explicit operation. Authenticate the Docker client without
 putting credentials in the build context, then use `--push`:
 
 ```console
-container/build-publish.sh --push ghcr.io/halbritt/runpod-jobrunner-noop 0.1.1
+container/build-publish.sh --push ghcr.io/halbritt/runpod-jobrunner-noop 0.1.2
 ```
 
 `Dockerfile.dockerignore` allow-lists only the package metadata, Python source,

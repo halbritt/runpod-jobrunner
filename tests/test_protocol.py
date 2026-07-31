@@ -280,6 +280,61 @@ def test_closeout_receipt_schema_requires_the_lifecycle_closeout_proof() -> None
         validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
 
 
+def test_closeout_receipt_requires_deadline_resolution_for_unknown_create() -> None:
+    receipt: dict[str, Any] = {
+        "protocol": "closeout-receipt/1",
+        "run_id": "run-schema-unknown-create",
+        "lifecycle": "closed",
+        "workload_result": "cancelled",
+        "approved_max_usd": "0.50",
+        "resource": None,
+        "operations": {
+            "provision": {"id": "op-provision", "status": "unresolved", "attempts": 1},
+            "delete": {
+                "id": "op-delete",
+                "status": "not_required_no_resource",
+                "attempts": 0,
+            },
+        },
+        "recovery_reason": "provision_dispatch_unresolved",
+        "closeout": {
+            "artifact_disposition": {
+                "status": "unavailable",
+                "detail": "provider create stayed unresolved",
+            },
+            "delete_acknowledged": True,
+            "delete_already_absent": True,
+            "provider_not_found": True,
+            "current_spend_usd_per_hour": "0",
+            "provision_absence_confirmed": True,
+            "provision_absence_first_observed_at": "2026-07-31T00:10:00Z",
+        },
+        "event_sequence": 12,
+    }
+
+    with pytest.raises(ValueError, match="provision_resolution"):
+        validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
+
+    receipt["closeout"]["provision_resolution"] = {
+        "source": "termination_deadline_elapsed",
+        "operation_id": "op-provision",
+        "termination_deadline": "2026-07-31T00:10:00Z",
+        "absence_first_observed_at": "2026-07-31T00:10:00Z",
+        "confirmed_at": "2026-07-31T00:10:05Z",
+    }
+    validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
+
+    status = json.loads(json.dumps(receipt))
+    status["protocol"] = "run-status/1"
+    status["closeout"].pop("provision_resolution")
+    with pytest.raises(ValueError, match="not valid under any"):
+        validate_protocol(status, "run-status/1", subject="status")
+    status["closeout"]["provision_resolution"] = receipt["closeout"][
+        "provision_resolution"
+    ]
+    validate_protocol(status, "run-status/1", subject="status")
+
+
 def test_current_remote_runner_records_conform_to_the_packaged_schemas(tmp_path: Path) -> None:
     request: dict[str, object] = {
         "protocol": "run-request/1",

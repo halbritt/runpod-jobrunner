@@ -9,6 +9,8 @@ import pytest
 
 from runpod_jobrunner.lifecycle import (
     ArtifactDisposition,
+    InvalidTransitionError,
+    LifecycleConflictError,
     LifecycleController,
     LifecycleState,
     WorkloadResult,
@@ -121,6 +123,72 @@ def test_unknown_create_waits_for_delayed_exact_resource_visibility(tmp_path: Pa
     assert adopted["lifecycle"] == LifecycleState.STARTING
     assert adopted["resource"]["id"] == "memory-pod-000001"
     assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+
+def test_unknown_create_cannot_close_before_deadline_when_resource_visibility_lags(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        value = datetime(2026, 7, 31, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            return self.value
+
+    class LateVisibleRunPod(MemoryRunPod):
+        visible = False
+
+        def find_resources(self, create_operation_id: str):  # type: ignore[no-untyped-def]
+            if not self.visible:
+                return ()
+            return super().find_resources(create_operation_id)
+
+        def current_spend_usd_per_hour(self, resource_id: str | None) -> Decimal:
+            if not self.visible:
+                return Decimal("0")
+            return super().current_spend_usd_per_hour(resource_id)
+
+    clock = Clock()
+    store = RunStore(tmp_path / "runs")
+    provider = LateVisibleRunPod()
+    controller = LifecycleController(store, provider, now=clock.now)
+    controller.plan(
+        "run-late-visible",
+        {
+            "job": "noop",
+            "provider": {"terminate_at": "2026-07-31T00:10:00Z"},
+        },
+        approved_max_usd="1",
+    )
+    controller.reconcile("run-late-visible")
+    provider.fail_next_after_effect("provision")
+
+    with pytest.raises(ProviderOutcomeUnknown):
+        controller.reconcile("run-late-visible")
+
+    clock.value += timedelta(seconds=31)
+    assert controller.reconcile("run-late-visible")["lifecycle"] == LifecycleState.RECOVERING
+    controller.request_stop("run-late-visible", reason="unknown create remained hidden")
+    assert controller.reconcile("run-late-visible")["lifecycle"] == LifecycleState.DELETING
+    clock.value += timedelta(seconds=6)
+    state: dict[str, object] = {}
+    for _ in range(4):
+        state = controller.reconcile("run-late-visible")
+
+    assert state["lifecycle"] == LifecycleState.DELETING
+    assert state["closeout"].get("provision_resolution") is None  # type: ignore[union-attr]
+    assert [effect.kind for effect in provider.effects].count("provision") == 1
+    assert [effect.kind for effect in provider.effects].count("delete") == 0
+
+    provider.visible = True
+    adopted = controller.reconcile("run-late-visible")
+    assert adopted["resource"]["id"] == "memory-pod-000001"
+    controller.reconcile("run-late-visible")
+    controller.reconcile("run-late-visible")
+    closed = controller.reconcile("run-late-visible")
+
+    assert closed["lifecycle"] == LifecycleState.CLOSED
+    assert provider.resources == {}
+    assert [effect.kind for effect in provider.effects].count("delete") == 1
 
 
 def test_unknown_create_is_reconciled_without_a_duplicate(tmp_path: Path) -> None:
@@ -259,6 +327,171 @@ def test_dispatched_create_without_visible_resource_enters_bounded_fail_closed_r
     assert recovering["closeout"]["artifact_disposition"]["status"] == (
         ArtifactDisposition.UNAVAILABLE
     )
+    assert provider.effects == []
+
+
+def test_no_effect_create_closes_only_after_deadline_and_fresh_absence_across_restart(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        value = datetime(2026, 7, 31, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            return self.value
+
+    clock = Clock()
+    store = RunStore(tmp_path / "runs")
+    provider = MemoryRunPod()
+    controller = LifecycleController(
+        store,
+        provider,
+        now=clock.now,
+        provision_visibility_grace_seconds=5,
+    )
+    controller.plan(
+        "run-no-effect",
+        {
+            "job": "noop",
+            "provider": {"terminate_at": "2026-07-31T00:00:20Z"},
+        },
+        approved_max_usd="1",
+    )
+    intended = controller.reconcile("run-no-effect")
+    operation_id = intended["operations"]["provision"]["id"]
+
+    def crash_before_create(_kind: str, _operation_id: str) -> None:
+        raise SystemExit("simulated death before provider effect")
+
+    provider.before_effect = crash_before_create
+    with pytest.raises(SystemExit, match="before provider effect"):
+        controller.reconcile("run-no-effect")
+    provider.before_effect = None
+    clock.value += timedelta(seconds=6)
+    controller.reconcile("run-no-effect")
+    controller.request_stop("run-no-effect", reason="create dispatch unresolved")
+    pre_deadline = controller.reconcile("run-no-effect")
+    assert pre_deadline["lifecycle"] == LifecycleState.DELETING
+    assert pre_deadline["closeout"]["provision_absence_first_observed_at"] is None
+
+    restarted = LifecycleController(
+        store,
+        provider,
+        now=clock.now,
+        provision_visibility_grace_seconds=5,
+    )
+    clock.value = datetime(2026, 7, 31, 0, 0, 19, tzinfo=UTC)
+    assert restarted.reconcile("run-no-effect")["lifecycle"] == LifecycleState.DELETING
+    clock.value += timedelta(seconds=1)
+    first_absence = restarted.reconcile("run-no-effect")
+    assert first_absence["closeout"]["provision_absence_first_observed_at"] == (
+        "2026-07-31T00:00:20+00:00"
+    )
+    assert first_absence["closeout"].get("provision_resolution") is None
+    clock.value += timedelta(seconds=4)
+    assert restarted.reconcile("run-no-effect")["lifecycle"] == LifecycleState.DELETING
+    clock.value += timedelta(seconds=1)
+    confirmed = restarted.reconcile("run-no-effect")
+
+    assert confirmed["closeout"]["provision_resolution"] == {
+        "source": "termination_deadline_elapsed",
+        "operation_id": operation_id,
+        "termination_deadline": "2026-07-31T00:00:20Z",
+        "absence_first_observed_at": "2026-07-31T00:00:20+00:00",
+        "confirmed_at": "2026-07-31T00:00:25+00:00",
+    }
+    restarted.reconcile("run-no-effect")
+    restarted.reconcile("run-no-effect")
+    closed = restarted.reconcile("run-no-effect")
+
+    assert closed["lifecycle"] == LifecycleState.CLOSED
+    assert closed["closeout"]["delete_already_absent"] is True
+    assert provider.effects == []
+
+
+def test_unknown_create_closeout_refuses_missing_deadline_resolution_proof(
+    tmp_path: Path,
+) -> None:
+    clock_value = datetime(2026, 7, 31, 0, 0, 10, tzinfo=UTC)
+    store = RunStore(tmp_path / "runs")
+    provider = MemoryRunPod()
+    controller = LifecycleController(
+        store,
+        provider,
+        now=lambda: clock_value,
+        provision_visibility_grace_seconds=5,
+    )
+    controller.plan(
+        "run-missing-resolution",
+        {
+            "job": "noop",
+            "provider": {"terminate_at": "2026-07-31T00:00:00Z"},
+        },
+        approved_max_usd="1",
+    )
+    controller.reconcile("run-missing-resolution")
+
+    def crash_before_create(_kind: str, _operation_id: str) -> None:
+        raise SystemExit("simulated death before provider effect")
+
+    provider.before_effect = crash_before_create
+    with pytest.raises(SystemExit, match="before provider effect"):
+        controller.reconcile("run-missing-resolution")
+    provider.before_effect = None
+    controller.reconcile("run-missing-resolution")
+    controller.request_stop("run-missing-resolution", reason="create dispatch unresolved")
+    controller.reconcile("run-missing-resolution")
+    clock_value += timedelta(seconds=5)
+    controller.reconcile("run-missing-resolution")
+    with store.transaction("run-missing-resolution") as transaction:
+        state = transaction.current_state()
+        state["closeout"].pop("provision_resolution")
+        transaction.commit_state("removed_resolution_fixture", state)
+    controller.reconcile("run-missing-resolution")
+    controller.reconcile("run-missing-resolution")
+
+    with pytest.raises(InvalidTransitionError, match="closeout proof is incomplete"):
+        controller.reconcile("run-missing-resolution")
+
+    assert controller.status("run-missing-resolution")["lifecycle"] == LifecycleState.DELETING
+
+
+@pytest.mark.parametrize(
+    ("provider_spec", "message"),
+    [
+        ({}, "termination deadline is missing"),
+        ({"terminate_at": "not-a-timestamp"}, "termination deadline is invalid"),
+        (
+            {"terminate_at": "2026-07-31T00:10:00"},
+            "termination deadline must be timezone-aware",
+        ),
+    ],
+)
+def test_unknown_create_with_unusable_termination_deadline_fails_loud(
+    tmp_path: Path,
+    provider_spec: dict[str, object],
+    message: str,
+) -> None:
+    controller, _, provider = make_controller(tmp_path)
+    controller.plan(
+        "run-bad-deadline",
+        {"job": "noop", "provider": provider_spec},
+        approved_max_usd="1",
+    )
+    controller.reconcile("run-bad-deadline")
+
+    def crash_before_create(_kind: str, _operation_id: str) -> None:
+        raise SystemExit("simulated death before provider effect")
+
+    provider.before_effect = crash_before_create
+    with pytest.raises(SystemExit, match="before provider effect"):
+        controller.reconcile("run-bad-deadline")
+    provider.before_effect = None
+    controller.request_stop("run-bad-deadline", reason="create dispatch unresolved")
+
+    with pytest.raises(LifecycleConflictError, match=message):
+        controller.reconcile("run-bad-deadline")
+
+    assert controller.status("run-bad-deadline")["lifecycle"] == LifecycleState.DELETING
     assert provider.effects == []
 
 

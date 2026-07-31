@@ -29,10 +29,16 @@ exit.
 Provider creation is an uncertainty boundary. A transport error, 5xx response,
 empty body, or invalid response after dispatch has an unknown outcome. The
 controller fences that operation and reconciles the stable run identity; it does
-not issue another create merely because a list result is briefly empty. Permanent
-authenticated-status failures become a failed workload observation followed by
-normal deletion instead of a supervisor restart loop. A torn final JSONL fragment
-may be removed during recovery; a complete malformed event remains a hard error.
+not issue another create merely because a list result is briefly empty. If no
+operation-specific `not_created` receipt exists, an uncertain create cannot close
+until the immutable `terminateAfter` deadline has elapsed and a new five-second
+absence window has passed. Closeout records that deadline proof and still requires
+zero current spend. A pod that becomes visible before then is adopted and deleted.
+Duplicate matches preserve one durable primary identity but all remain visible to
+the deletion loop. Permanent authenticated-status failures become a failed
+workload observation followed by normal deletion instead of a supervisor restart
+loop. A torn final JSONL fragment may be removed during recovery; a complete
+malformed event remains a hard error.
 
 When several paid runs share one principal grant, pass one budget scope and total
 to every `run` command. The durable ledger reserves each job's full cap and does

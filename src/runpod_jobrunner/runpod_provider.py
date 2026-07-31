@@ -353,17 +353,24 @@ class RunPodProvider:
         )
         checked = tuple(self._checked_observation(pod, create_operation_id) for pod in matches)
         run_id = self._read_operation_text(create_operation_id, "run-id") if checked else ""
-        resources: list[ProviderResource] = []
-        for pod in checked:
-            self._persist_operation_text(create_operation_id, "resource-id", pod.id)
-            resources.append(
-                self._resource(
-                    pod,
-                    create_operation_id=create_operation_id,
-                    observed_run_id=run_id,
+        if checked:
+            primary_path = self._secrets_root / create_operation_id / "resource-id"
+            if primary_path.exists():
+                self._read_operation_text(create_operation_id, "resource-id")
+            else:
+                self._persist_operation_text(
+                    create_operation_id,
+                    "resource-id",
+                    min(pod.id for pod in checked),
                 )
+        return tuple(
+            self._resource(
+                pod,
+                create_operation_id=create_operation_id,
+                observed_run_id=run_id,
             )
-        return tuple(resources)
+            for pod in checked
+        )
 
     def create(self, request: ProviderCreateRequest) -> ProviderResource:
         spec = request.spec

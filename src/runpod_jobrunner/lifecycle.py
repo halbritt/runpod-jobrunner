@@ -25,6 +25,8 @@ from runpod_jobrunner.run_store import RunStore, RunTransaction
 
 _OPERATION_NAMESPACE = uuid.UUID("c2ad7d61-943e-42c8-9353-b864fd25f7f0")
 _PROVISION_VISIBILITY_GRACE_SECONDS = 30.0
+_PROVISION_ABSENCE_GRACE_SECONDS = 5.0
+_UNCERTAIN_PROVISION_STATUSES = frozenset({"dispatched", "outcome_unknown", "unresolved"})
 
 
 class LifecycleState(StrEnum):
@@ -455,7 +457,13 @@ class LifecycleController:
         provision_value = operations.get("provision")
         if resource_value is None and isinstance(provision_value, dict):
             provision = cast(dict[str, Any], provision_value)
-            _integer(provision.get("attempts", 0))
+            provision_attempts = _integer(provision.get("attempts", 0))
+            deadline_resolution_required = (
+                provision_attempts > 0
+                and provision.get("status") in _UNCERTAIN_PROVISION_STATUSES
+            )
+            termination_deadline: datetime | None = None
+            termination_deadline_text: str | None = None
             if not closeout.get("provision_absence_confirmed"):
                 provision_operation_id = _string(provision, "id")
                 try:
@@ -486,7 +494,23 @@ class LifecycleController:
                         state,
                         {"resource_id": matches[0].id},
                     )
+                if deadline_resolution_required:
+                    termination_deadline_text, termination_deadline = (
+                        self._provider_termination_deadline(state)
+                    )
                 now = self._now()
+                if now.tzinfo is None:
+                    raise LifecycleConflictError("current time must be timezone-aware")
+                if termination_deadline is not None and now < termination_deadline:
+                    closeout["provision_absence_first_observed_at"] = None
+                    return transaction.commit_state(
+                        "stopped_provision_termination_pending",
+                        state,
+                        {
+                            "operation_id": provision_operation_id,
+                            "termination_deadline": termination_deadline_text,
+                        },
+                    )
                 first_value = closeout.get("provision_absence_first_observed_at")
                 if not isinstance(first_value, str):
                     closeout["provision_absence_first_observed_at"] = now.isoformat()
@@ -499,13 +523,32 @@ class LifecycleController:
                     first = datetime.fromisoformat(first_value)
                 except ValueError:
                     raise LifecycleConflictError("provision absence timestamp is invalid") from None
-                if (now - first).total_seconds() < 5:
+                if first.tzinfo is None:
+                    raise LifecycleConflictError(
+                        "provision absence timestamp must be timezone-aware"
+                    )
+                if termination_deadline is not None and first < termination_deadline:
+                    closeout["provision_absence_first_observed_at"] = now.isoformat()
+                    return transaction.commit_state(
+                        "stopped_provision_absence_observed",
+                        state,
+                        {"operation_id": provision_operation_id},
+                    )
+                if (now - first).total_seconds() < _PROVISION_ABSENCE_GRACE_SECONDS:
                     return transaction.commit_state(
                         "stopped_provision_absence_pending",
                         state,
                         {"operation_id": provision_operation_id},
                     )
                 closeout["provision_absence_confirmed"] = True
+                if termination_deadline is not None:
+                    closeout["provision_resolution"] = {
+                        "source": "termination_deadline_elapsed",
+                        "operation_id": provision_operation_id,
+                        "termination_deadline": termination_deadline_text,
+                        "absence_first_observed_at": first.isoformat(),
+                        "confirmed_at": now.isoformat(),
+                    }
                 return transaction.commit_state(
                     "stopped_provision_absence_confirmed",
                     state,
@@ -597,6 +640,27 @@ class LifecycleController:
             state,
             {"current_spend_usd_per_hour": _format_money(spend)},
         )
+
+    def _provider_termination_deadline(
+        self, state: Mapping[str, object]
+    ) -> tuple[str, datetime]:
+        request = self.store.read_request(_string(state, "run_id"))
+        provider_value = request.get("provider")
+        if not isinstance(provider_value, Mapping):
+            raise LifecycleConflictError("provider termination deadline is missing")
+        provider = cast(Mapping[str, object], provider_value)
+        deadline_text = provider.get("terminate_at")
+        if not isinstance(deadline_text, str) or not deadline_text:
+            raise LifecycleConflictError("provider termination deadline is missing")
+        try:
+            deadline = datetime.fromisoformat(deadline_text)
+        except ValueError:
+            raise LifecycleConflictError("provider termination deadline is invalid") from None
+        if deadline.tzinfo is None:
+            raise LifecycleConflictError(
+                "provider termination deadline must be timezone-aware"
+            )
+        return deadline_text, deadline
 
     def _record_delete_receipt(
         self,
@@ -690,22 +754,67 @@ class LifecycleController:
             },
         )
 
-    @staticmethod
-    def _assert_closeout_ready(state: Mapping[str, object]) -> None:
+    def _assert_closeout_ready(self, state: Mapping[str, object]) -> None:
         closeout = _object_value(state.get("closeout"), "closeout")
         required = (
             closeout.get("artifact_disposition") is not None,
             closeout.get("delete_acknowledged") is True,
             closeout.get("provider_not_found") is True,
             closeout.get("current_spend_usd_per_hour") == "0",
+            self._provision_resolution_is_complete(state, closeout),
         )
         if not all(required):
             raise InvalidTransitionError("closeout proof is incomplete")
+
+    def _provision_resolution_is_complete(
+        self,
+        state: Mapping[str, object],
+        closeout: Mapping[str, object],
+    ) -> bool:
+        if state.get("resource") is not None:
+            return True
+        operations = _object_value(state.get("operations"), "operations")
+        provision_value = operations.get("provision")
+        if not isinstance(provision_value, Mapping):
+            return True
+        provision = cast(Mapping[str, object], provision_value)
+        if (
+            _integer(provision.get("attempts", 0)) == 0
+            or provision.get("status") not in _UNCERTAIN_PROVISION_STATUSES
+        ):
+            return True
+        resolution_value = closeout.get("provision_resolution")
+        if not isinstance(resolution_value, Mapping):
+            return False
+        resolution = cast(Mapping[str, object], resolution_value)
+        deadline_text, deadline = self._provider_termination_deadline(state)
+        first = _aware_datetime_or_none(resolution.get("absence_first_observed_at"))
+        confirmed = _aware_datetime_or_none(resolution.get("confirmed_at"))
+        return (
+            closeout.get("provision_absence_confirmed") is True
+            and resolution.get("source") == "termination_deadline_elapsed"
+            and resolution.get("operation_id") == provision.get("id")
+            and resolution.get("termination_deadline") == deadline_text
+            and first is not None
+            and confirmed is not None
+            and first >= deadline
+            and (confirmed - first).total_seconds() >= _PROVISION_ABSENCE_GRACE_SECONDS
+        )
 
 
 def _new_operation(run_id: str, kind: str) -> dict[str, object]:
     stable = uuid.uuid5(_OPERATION_NAMESPACE, f"runpod-jobrunner/{run_id}/{kind}/1")
     return {"id": f"op-{stable}", "status": "intended", "attempts": 0}
+
+
+def _aware_datetime_or_none(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _resource_projection(resource: ProviderResource) -> dict[str, object]:

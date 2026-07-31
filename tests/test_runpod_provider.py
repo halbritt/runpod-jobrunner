@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import replace
 from decimal import Decimal
 from email.message import Message
 from pathlib import Path
@@ -297,6 +298,65 @@ def test_production_adapter_reconciles_by_operation_environment(tmp_path: Path) 
     matches = provider.find_resources(provider_request().operation_id)
 
     assert matches == (created,)
+
+
+def test_production_adapter_returns_duplicate_matches_without_changing_primary_resource(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    request = provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    provider.create(request)
+    api.pods["pod-2"] = replace(api.pods["pod-1"], id="pod-2")
+
+    matches = provider.find_resources(request.operation_id)
+
+    assert tuple(resource.id for resource in matches) == ("pod-1", "pod-2")
+    primary_path = tmp_path / "secrets" / request.operation_id / "resource-id"
+    assert primary_path.read_text().strip() == "pod-1"
+
+
+def test_production_adapter_returns_non_primary_survivor_after_primary_delete(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    request = provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    provider.create(request)
+    api.pods["pod-2"] = replace(api.pods["pod-1"], id="pod-2")
+    provider.find_resources(request.operation_id)
+    provider.delete("pod-1", "delete-primary")
+
+    matches = provider.find_resources(request.operation_id)
+
+    assert tuple(resource.id for resource in matches) == ("pod-2",)
+    primary_path = tmp_path / "secrets" / request.operation_id / "resource-id"
+    assert primary_path.read_text().strip() == "pod-1"
+
+
+def test_production_adapter_elects_one_primary_after_unknown_duplicate_create(
+    tmp_path: Path,
+) -> None:
+    class UnknownDuplicateAPI(FakeAPI):
+        def create_encrypted_pod(
+            self, request: PodCreateRequest, *, volume_key: str
+        ) -> PodObservation:
+            primary = super().create_encrypted_pod(request, volume_key=volume_key)
+            self.pods["pod-2"] = replace(primary, id="pod-2")
+            raise RunPodTransportOutcomeUnknown("POST")
+
+    api = UnknownDuplicateAPI()
+    request = provider_request()
+    primary_path = tmp_path / "secrets" / request.operation_id / "resource-id"
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    with pytest.raises(ProviderOutcomeUnknown):
+        provider.create(request)
+    assert not primary_path.exists()
+
+    matches = provider.find_resources(request.operation_id)
+
+    assert tuple(resource.id for resource in matches) == ("pod-1", "pod-2")
+    assert primary_path.read_text().strip() == "pod-1"
 
 
 def test_production_adapter_maps_unknown_create_outcome(tmp_path: Path) -> None:

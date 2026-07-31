@@ -57,7 +57,8 @@
         "provision_absence_first_observed_at": {
           "type": ["string", "null"],
           "format": "date-time"
-        }
+        },
+        "provision_resolution": {"$ref": "#/$defs/provision-resolution"}
       },
       "additionalProperties": true
     },
@@ -68,6 +69,38 @@
       "uniqueItems": true
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "resource": {"type": "null"},
+          "operations": {
+            "required": ["provision"],
+            "properties": {
+              "provision": {
+                "required": ["status", "attempts"],
+                "properties": {
+                  "status": {
+                    "enum": ["dispatched", "outcome_unknown", "unresolved"]
+                  },
+                  "attempts": {"minimum": 1}
+                }
+              }
+            }
+          }
+        },
+        "required": ["resource", "operations"]
+      },
+      "then": {
+        "properties": {
+          "closeout": {
+            "required": ["provision_absence_confirmed", "provision_resolution"],
+            "properties": {"provision_absence_confirmed": {"const": true}}
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": true,
   "$defs": {
     "run-id": {
@@ -88,6 +121,24 @@
         "detail": {"type": ["string", "null"]}
       },
       "additionalProperties": true
+    },
+    "provision-resolution": {
+      "type": "object",
+      "required": [
+        "source",
+        "operation_id",
+        "termination_deadline",
+        "absence_first_observed_at",
+        "confirmed_at"
+      ],
+      "properties": {
+        "source": {"const": "termination_deadline_elapsed"},
+        "operation_id": {"type": "string", "pattern": "^op-.+"},
+        "termination_deadline": {"type": "string", "format": "date-time"},
+        "absence_first_observed_at": {"type": "string", "format": "date-time"},
+        "confirmed_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
     },
     "operation": {
       "type": "object",

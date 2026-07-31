@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from runpod_jobrunner import __version__
 from runpod_jobrunner.identity import (
     RunnerIdentityError,
     load_runner_identity,
@@ -17,7 +18,7 @@ def test_release_receipt_binds_version_commit_and_protocol_majors(tmp_path: Path
         json.dumps(
             {
                 "protocol": "runner-release/1",
-                "runner_version": "0.1.1",
+                "runner_version": __version__,
                 "runner_git_commit": "a" * 40,
                 "supported_protocol_majors": {
                     "artifact-manifest": [1],
@@ -32,7 +33,7 @@ def test_release_receipt_binds_version_commit_and_protocol_majors(tmp_path: Path
 
     identity = load_runner_identity(receipt)
 
-    assert identity.version == "0.1.1"
+    assert identity.version == __version__
     assert identity.git_commit == "a" * 40
     assert identity.supported_protocol_majors == {
         "artifact-manifest": (1,),
@@ -67,7 +68,7 @@ def test_release_receipt_rejects_ambiguous_identity(
     receipt = tmp_path / "release.json"
     record: dict[str, object] = {
         "protocol": "runner-release/1",
-        "runner_version": "0.1.1",
+        "runner_version": __version__,
         "runner_git_commit": "a" * 40,
         "supported_protocol_majors": {
             "artifact-manifest": [1],
