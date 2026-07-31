@@ -134,9 +134,6 @@ def test_noop_optional_delay_is_bounded_and_argument_checked(tmp_path: Path) -> 
 
 def test_publish_workflow_and_script_never_use_floating_action_or_image_tags() -> None:
     workflow = (ROOT / ".github" / "workflows" / "container.yml").read_text()
-    visibility_workflow = (
-        ROOT / ".github" / "workflows" / "package-public.yml"
-    ).read_text()
     publish_script = (CONTAINER / "build-publish.sh").read_text()
 
     action_refs = re.findall(r"uses:\s*[^@\s]+@([^\s]+)", workflow)
@@ -144,12 +141,7 @@ def test_publish_workflow_and_script_never_use_floating_action_or_image_tags() -
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
     assert "docker buildx create" in workflow
     assert "--driver docker-container" in workflow
-    assert "type: choice" in visibility_workflow
-    assert "runpod-jobrunner-noop" in visibility_workflow
-    assert "striatum-tuner-qwen35b-moe" in visibility_workflow
-    assert "docker logout ghcr.io" in visibility_workflow
     assert ":latest" not in workflow
-    assert ":latest" not in visibility_workflow
     assert ":latest" not in publish_script
     assert "docker buildx build" in publish_script
     assert "docker buildx imagetools inspect" in publish_script

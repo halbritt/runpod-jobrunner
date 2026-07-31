@@ -1,7 +1,7 @@
 protocol: job-spec/1
 name: noop
-bundle_hash: 1adf0f7a5fbfd1420d09e18450067d239e1a53eba8745594bd4d9492705d1403
-image: ghcr.io/halbritt/runpod-jobrunner-noop@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bundle_hash: 0a64bc53b2ae28145e8c99d43d502d8b8d5ec24dd3eadb8ab7d7aeb31ef9f3ed
+image: ghcr.io/halbritt/runpod-jobrunner-noop@sha256:deed9d39a9bb088c1260dba29db8650982285de2f6365fe281b63231a36e2646
 runner:
   version: 0.1.0
 resources:
