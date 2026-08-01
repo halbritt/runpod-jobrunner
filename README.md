@@ -74,6 +74,11 @@ upload the allow-listed job inputs and a separate random launch token. Identity
 failure therefore reaches deletion without disclosing job input bytes or starting
 a phase. Durable publication receipts make controller restarts idempotent.
 
+Starting with 0.1.8, the controller also bounds the interval from provider
+creation to the first authenticated worker status by the launch-authorization
+timeout. A broken entrypoint or restart loop therefore fails into lifecycle
+cleanup instead of consuming the entire workload deadline before any phase starts.
+
 Long-running jobs can opt into incremental, content-verified artifact recovery:
 
 ```yaml

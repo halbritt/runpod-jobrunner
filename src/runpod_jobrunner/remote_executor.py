@@ -58,6 +58,10 @@ class _IncrementalCacheMiss(ApplicationError):
     """A safe local checkpoint cache needs to be populated or replaced."""
 
 
+class _RemoteStartupTimeout(ApplicationError):
+    """The provider never exposed the authenticated runner in time."""
+
+
 class _PodAPI(Protocol):
     def get_pod(self, pod_id: str) -> PodObservation | None: ...
 
@@ -121,6 +125,7 @@ class RunPodRemoteExecutor:
         status_fetcher: StatusFetcher | None = None,
         free_space_bytes: FreeSpaceBytes | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
         poll_interval_seconds: float = 2.0,
     ) -> None:
         self._api = api
@@ -130,6 +135,7 @@ class RunPodRemoteExecutor:
         self._status_fetcher = status_fetcher or _fetch_status
         self._free_space_bytes = free_space_bytes or _available_bytes
         self._sleep = sleep
+        self._monotonic = monotonic
         self._poll_interval = poll_interval_seconds
         self._verified_incremental_receipts: set[str] = set()
 
@@ -140,7 +146,20 @@ class RunPodRemoteExecutor:
         resource_id = _resource_id(run_dir)
         deadline = _deadline(_mapping(request.get("provider"), "request.provider"))
         try:
-            pod = self._wait_for_connectivity(resource_id, deadline, remote)
+            launch_authorization = parse_launch_authorization(
+                remote.get("launch_authorization")
+            )
+        except LaunchAuthorizationError as error:
+            return _failed(f"launch authorization contract is invalid: {error}")
+        startup_deadline = self._monotonic() + launch_authorization.timeout_seconds
+        try:
+            pod = self._wait_for_connectivity(
+                resource_id, deadline, startup_deadline, remote
+            )
+        except _RemoteStartupTimeout:
+            return _failed(
+                "remote startup deadline reached before authenticated status"
+            )
         except ApplicationError as error:
             return _failed(f"provider storage attestation failed: {error}")
         if pod is None:
@@ -163,6 +182,10 @@ class RunPodRemoteExecutor:
         status_url = f"https://{resource_id}-8080.proxy.runpod.net/status"
         stale_after = max(30.0, float(_positive_number(remote, "heartbeat_interval_seconds")) * 3)
         while datetime.now(UTC) < deadline:
+            if self._monotonic() >= startup_deadline:
+                return _failed(
+                    "remote startup deadline reached before authenticated status"
+                )
             try:
                 status_value = self._status_fetcher(status_url, token)
                 status = _mapping(status_value, "remote status")
@@ -178,6 +201,7 @@ class RunPodRemoteExecutor:
                     run_dir, "authenticated remote status identity mismatch"
                 )
             _atomic_json(run_dir / "remote-status.json", status)
+            startup_deadline = float("inf")
             identity_error = _remote_identity_error(status, remote)
             if identity_error is not None:
                 return self._permanent_failure(
@@ -690,12 +714,15 @@ class RunPodRemoteExecutor:
         self,
         resource_id: str,
         deadline: datetime,
+        startup_deadline: float,
         remote: Mapping[str, object],
     ) -> PodObservation | None:
         storage = _mapping(remote.get("storage"), "remote.storage")
         encrypted = storage.get("encrypted")
         expected_network_volume_id = storage.get("network_volume_id")
         while datetime.now(UTC) < deadline:
+            if self._monotonic() >= startup_deadline:
+                raise _RemoteStartupTimeout
             pod = self._api.get_pod(resource_id)
             if pod is None:
                 return None

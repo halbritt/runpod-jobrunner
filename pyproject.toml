@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runpod-jobrunner"
-version = "0.1.7"
+version = "0.1.8"
 description = "Recoverable, bounded RunPod jobs with a fixed execution protocol"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -342,6 +342,29 @@ def prepare_run_dir(tmp_path: Path) -> Path:
     return run_dir
 
 
+def test_remote_startup_is_bounded_before_provider_termination_deadline(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    transfer = FakeTransfer(remote)
+    ticks = iter((0.0, 1.0, 31.0))
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=lambda _url, _token: (_ for _ in ()).throw(OSError("not ready")),
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(ticks),
+    )
+
+    observation = executor.execute(make_request(tmp_path), run_dir)
+
+    assert observation.result == WorkloadResult.FAILED
+    assert observation.detail == "remote startup deadline reached before authenticated status"
+
+
 def test_identity_mismatch_never_uploads_private_inputs_or_launch_authorization(
     tmp_path: Path,
 ) -> None:
