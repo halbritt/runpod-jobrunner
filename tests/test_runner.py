@@ -83,6 +83,7 @@ def make_request(
         },
         "heartbeat_interval_seconds": 0.02,
         "termination_grace_seconds": 0.2,
+        "artifact_path_base": "run-root",
         "launch_authorization": {
             "protocol": LAUNCH_PROTOCOL,
             "path": LAUNCH_RELATIVE_PATH,
@@ -175,6 +176,14 @@ def test_runner_rejects_identity_mismatch_before_any_phase(
     assert status["runner_git_commit"] == identity.git_commit
 
 
+def test_runner_requires_the_explicit_run_root_artifact_base(tmp_path: Path) -> None:
+    request = make_request(tmp_path)
+    request.pop("artifact_path_base")
+
+    with pytest.raises(RequestError, match="artifact_path_base must be run-root"):
+        runner(request, tmp_path / "status")
+
+
 def test_missing_published_release_receipt_fails_with_authenticated_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -210,6 +219,50 @@ def test_runner_executes_enabled_phases_in_fixed_order(tmp_path: Path) -> None:
     assert status["terminal_result"] == terminal
     events = [json.loads(line) for line in (status_dir / "events.jsonl").read_text().splitlines()]
     assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+
+
+def test_runner_accepts_an_existing_network_volume_request(tmp_path: Path) -> None:
+    request = make_request(
+        tmp_path,
+        storage={
+            "encrypted": False,
+            "network_volume_id": "network-volume-123",
+            "mount": str(tmp_path),
+            "required_gb": 1,
+        },
+    )
+
+    terminal = runner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        {"encrypted": False, "mount": "/workspace", "required_gb": 1},
+        {
+            "encrypted": False,
+            "network_volume_id": "   ",
+            "mount": "/workspace",
+            "required_gb": 1,
+        },
+        {
+            "encrypted": True,
+            "network_volume_id": "network-volume-123",
+            "mount": "/workspace",
+            "required_gb": 1,
+        },
+    ],
+)
+def test_runner_rejects_ambiguous_or_missing_network_volume_identity(
+    tmp_path: Path,
+    storage: dict[str, object],
+) -> None:
+    request = make_request(tmp_path, storage=storage)
+
+    with pytest.raises(RequestError, match="network_volume_id"):
+        runner(request, tmp_path / "status")
 
 
 def test_runner_publishes_ready_and_waits_for_matching_launch_authorization(
@@ -305,7 +358,7 @@ def test_success_with_declared_artifacts_publishes_verified_manifest_hash(
     payload = b"verified artifact\n"
     package_script = (
         "import hashlib,json,os,pathlib;"
-        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_STORAGE_MOUNT']);"
+        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_RUN_ROOT']);"
         "p=root/'artifacts'/'result.txt';p.parent.mkdir(parents=True,exist_ok=True);"
         f"p.write_bytes({payload!r});"
         "m={'protocol':'artifact-manifest/1','run_id':os.environ['RUNPOD_JOBRUNNER_RUN_ID'],"
@@ -321,7 +374,8 @@ def test_success_with_declared_artifacts_publishes_verified_manifest_hash(
 
     terminal = runner(request, tmp_path / "status").run()
 
-    manifest = tmp_path / "artifacts" / "manifest.json"
+    run_root = tmp_path / "runpod-jobrunner" / "runs" / "run-test-001"
+    manifest = run_root / "artifacts" / "manifest.json"
     assert terminal["outcome"] == "succeeded"
     assert terminal["artifact_manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert terminal["artifact_manifest_size"] == manifest.stat().st_size
@@ -339,13 +393,50 @@ def test_success_fails_closed_when_declared_artifact_manifest_is_missing(
     assert terminal["reason"] == "artifact_manifest_missing"
 
 
+def test_success_does_not_reuse_a_declared_manifest_from_a_sibling_run(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path)
+    request["artifact_manifest_path"] = "artifacts/manifest.json"
+    sibling_artifacts = (
+        tmp_path
+        / "runpod-jobrunner"
+        / "runs"
+        / "run-stale"
+        / "artifacts"
+    )
+    sibling_artifacts.mkdir(parents=True)
+    payload = b"stale artifact\n"
+    (sibling_artifacts / "result.txt").write_bytes(payload)
+    (sibling_artifacts / "manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": "artifact-manifest/1",
+                "run_id": "run-stale",
+                "files": [
+                    {
+                        "path": "artifacts/result.txt",
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ],
+            }
+        )
+    )
+
+    terminal = runner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "artifact_manifest_missing"
+
+
 def test_success_fails_closed_when_declared_artifact_hash_is_wrong(tmp_path: Path) -> None:
     request = make_request(tmp_path)
     request["artifact_manifest_path"] = "artifacts/manifest.json"
     phases = cast(dict[str, object], request["phases"])
     script = (
         "import json,os,pathlib;"
-        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_STORAGE_MOUNT']);"
+        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_RUN_ROOT']);"
         "p=root/'artifacts'/'result.txt';p.parent.mkdir(parents=True,exist_ok=True);"
         "p.write_bytes(b'actual');"
         "m={'protocol':'artifact-manifest/1','files':[{'path':'artifacts/result.txt',"

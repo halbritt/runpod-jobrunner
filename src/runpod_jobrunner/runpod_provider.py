@@ -1,7 +1,8 @@
 """Narrow RunPod control-plane adapter.
 
-Creation uses the official GraphQL API because it is the Pod API surface that
-supports both a caller-supplied encrypted-volume key and provider-side
+Creation uses the official GraphQL API because it accepts encrypted-volume keys,
+existing network-volume IDs, and provider-side ``terminateAfter`` in one request.
+The REST create surface documents network-volume attachment but not
 ``terminateAfter``. Reads and deletion use the official v1 REST API.
 """
 
@@ -66,11 +67,12 @@ class PodCreateRequest:
     gpu_type_id: str
     gpu_count: int
     container_disk_gb: int
-    volume_gb: int
+    volume_gb: int | None
     volume_mount_path: str
     ports: tuple[str, ...]
     environment: Mapping[str, str]
     terminate_at: str
+    network_volume_id: str | None = None
     cloud_type: str = "SECURE"
 
 
@@ -81,6 +83,7 @@ class PodObservation:
     desired_status: str | None
     cost_per_hour: Decimal | None
     volume_encrypted: bool | None
+    network_volume_id: str | None = None
     image: str | None = None
     public_ip: str | None = None
     port_mappings: Mapping[str, int] | None = None
@@ -106,8 +109,49 @@ class RunPodHTTP:
     def create_encrypted_pod(self, request: PodCreateRequest, *, volume_key: str) -> PodObservation:
         if _VOLUME_KEY.fullmatch(volume_key) is None:
             raise ValueError("volume key must be 1-30 alphanumeric characters")
+        if request.volume_gb is None or request.volume_gb <= 0:
+            raise ValueError("encrypted pod storage requires a positive volume size")
+        if request.network_volume_id is not None:
+            raise ValueError("encrypted pod storage cannot attach a network volume")
         if request.cloud_type != "SECURE":
             raise SecurityInvariantError("encrypted jobs require Secure Cloud")
+        pod = self._create_pod(
+            request,
+            storage={"volumeInGb": request.volume_gb, "volumeKey": volume_key},
+        )
+        if pod.volume_encrypted is not True:
+            self._reject_created_pod(pod.id, "RunPod created an unencrypted pod")
+        return pod
+
+    def create_network_volume_pod(self, request: PodCreateRequest) -> PodObservation:
+        network_volume_id = request.network_volume_id
+        if (
+            not isinstance(network_volume_id, str)
+            or not network_volume_id.strip()
+            or any(character in network_volume_id for character in "\x00\r\n")
+        ):
+            raise ValueError("network volume ID must be a non-empty provider ID")
+        if request.volume_gb is not None:
+            raise ValueError("a network-volume pod must not request a pod volume disk")
+        if request.cloud_type != "SECURE":
+            raise SecurityInvariantError("network volumes require Secure Cloud")
+        pod = self._create_pod(
+            request,
+            storage={"networkVolumeId": network_volume_id},
+        )
+        if pod.network_volume_id != network_volume_id:
+            self._reject_created_pod(
+                pod.id,
+                "RunPod did not prove the requested network volume attachment",
+            )
+        return pod
+
+    def _create_pod(
+        self,
+        request: PodCreateRequest,
+        *,
+        storage: Mapping[str, object],
+    ) -> PodObservation:
         variables = {
             "input": {
                 "name": request.name,
@@ -116,9 +160,7 @@ class RunPodHTTP:
                 "gpuCount": request.gpu_count,
                 "cloudType": request.cloud_type,
                 "containerDiskInGb": request.container_disk_gb,
-                "volumeInGb": request.volume_gb,
                 "volumeMountPath": request.volume_mount_path,
-                "volumeKey": volume_key,
                 "ports": ",".join(request.ports),
                 "startSsh": True,
                 "startJupyter": False,
@@ -127,6 +169,7 @@ class RunPodHTTP:
                     {"key": key, "value": value}
                     for key, value in sorted(request.environment.items())
                 ],
+                **storage,
             }
         }
         query = """
@@ -134,6 +177,7 @@ class RunPodHTTP:
             podFindAndDeployOnDemand(input: $input) {
               id name imageName desiredStatus costPerHr volumeEncrypted env
               volumeInGb volumeMountPath
+              networkVolume { id }
               machine { dataCenterId secureCloud gpuTypeId currentPricePerGpu }
             }
           }
@@ -150,24 +194,28 @@ class RunPodHTTP:
             raise RunPodTransportOutcomeUnknown(
                 f"RunPod create outcome unknown: {error}"
             ) from error
-        if pod.volume_encrypted is not True:
-            cleanup_error: str | None = None
-            try:
-                self.delete_pod(pod.id)
-            except ProviderProtocolError as error:
-                cleanup_error = str(error)
-            suffix = "" if cleanup_error is None else f"; cleanup also failed: {cleanup_error}"
-            raise SecurityInvariantError(
-                f"RunPod created an unencrypted pod; deletion requested{suffix}",
-                resource_id=pod.id,
-            )
         return pod
+
+    def _reject_created_pod(self, pod_id: str, message: str) -> NoReturn:
+        cleanup_error: str | None = None
+        try:
+            self.delete_pod(pod_id)
+        except ProviderProtocolError as error:
+            cleanup_error = str(error)
+        suffix = "" if cleanup_error is None else f"; cleanup also failed: {cleanup_error}"
+        raise SecurityInvariantError(
+            f"{message}; deletion requested{suffix}",
+            resource_id=pod_id,
+        )
 
     def find_pods_by_exact_name(self, name: str) -> tuple[PodObservation, ...]:
         return tuple(pod for pod in self.list_pods() if pod.name == name)
 
     def list_pods(self) -> tuple[PodObservation, ...]:
-        raw = self._json_request("GET", REST_PODS_URL)
+        raw = self._json_request(
+            "GET",
+            f"{REST_PODS_URL}?{urlencode({'includeNetworkVolume': 'true'})}",
+        )
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
             raise ProviderProtocolError("RunPod pod list was not an array")
         observations: list[PodObservation] = []
@@ -178,7 +226,11 @@ class RunPodHTTP:
         return tuple(observations)
 
     def get_pod(self, pod_id: str) -> PodObservation | None:
-        raw = self._json_request("GET", f"{REST_PODS_URL}/{pod_id}", allow_not_found=True)
+        raw = self._json_request(
+            "GET",
+            f"{REST_PODS_URL}/{pod_id}?{urlencode({'includeNetworkVolume': 'true'})}",
+            allow_not_found=True,
+        )
         if raw is None:
             return None
         if not isinstance(raw, Mapping):
@@ -329,6 +381,7 @@ def _parse_pod(raw: Mapping[str, Any]) -> PodObservation:
         raise ProviderProtocolError("RunPod pod record has an invalid hourly rate")
     mappings = raw.get("portMappings")
     environment = _parse_environment(raw.get("env"))
+    network_volume_id = _parse_network_volume_id(raw.get("networkVolume"))
     return PodObservation(
         id=pod_id,
         name=name,
@@ -337,6 +390,7 @@ def _parse_pod(raw: Mapping[str, Any]) -> PodObservation:
         volume_encrypted=(
             raw.get("volumeEncrypted") if isinstance(raw.get("volumeEncrypted"), bool) else None
         ),
+        network_volume_id=network_volume_id,
         image=_optional_string(raw.get("imageName", raw.get("image"))),
         public_ip=_optional_string(raw.get("publicIp")),
         port_mappings=(
@@ -344,6 +398,17 @@ def _parse_pod(raw: Mapping[str, Any]) -> PodObservation:
         ),
         environment=environment,
     )
+
+
+def _parse_network_volume_id(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ProviderProtocolError("RunPod pod record has malformed network volume data")
+    network_volume_id = cast(Mapping[str, object], value).get("id")
+    if not isinstance(network_volume_id, str) or not network_volume_id:
+        raise ProviderProtocolError("RunPod pod record lacks network volume identity")
+    return network_volume_id
 
 
 def _optional_string(value: object) -> str | None:
@@ -376,6 +441,8 @@ class _RunPodAPI(Protocol):
     def create_encrypted_pod(
         self, request: PodCreateRequest, *, volume_key: str
     ) -> PodObservation: ...
+
+    def create_network_volume_pod(self, request: PodCreateRequest) -> PodObservation: ...
 
     def list_pods(self) -> tuple[PodObservation, ...]: ...
 
@@ -413,7 +480,16 @@ class RunPodProvider:
             )
             or (expected_name is not None and pod.name == expected_name)
         )
-        checked = tuple(self._checked_observation(pod, create_operation_id) for pod in matches)
+        try:
+            checked = tuple(
+                self._checked_observation(pod, create_operation_id) for pod in matches
+            )
+        except ProviderRejected as error:
+            raise ProviderRejected(
+                str(error),
+                resource_id=error.resource_id,
+                resource_ids=tuple(pod.id for pod in matches),
+            ) from error
         run_id = self._read_operation_text(create_operation_id, "run-id") if checked else ""
         if checked:
             primary_path = self._secrets_root / create_operation_id / "resource-id"
@@ -436,6 +512,23 @@ class RunPodProvider:
 
     def create(self, request: ProviderCreateRequest) -> ProviderResource:
         spec = request.spec
+        if "network_volume_id" in spec:
+            network_volume_id = _required_string(spec, "network_volume_id")
+            if (
+                not network_volume_id.strip()
+                or any(character in network_volume_id for character in "\x00\r\n")
+            ):
+                raise InternalProviderProtocolError(
+                    "provider spec network_volume_id must be a non-empty provider ID"
+                )
+            if "volume_gb" in spec:
+                raise InternalProviderProtocolError(
+                    "provider spec cannot request both network_volume_id and volume_gb"
+                )
+            volume_gb: int | None = None
+        else:
+            network_volume_id = None
+            volume_gb = _positive_integer(spec, "volume_gb")
         environment = _string_mapping(spec.get("environment", {}), "environment")
         environment.update(
             {
@@ -449,20 +542,37 @@ class RunPodProvider:
             gpu_type_id=_required_string(spec, "gpu_type_id"),
             gpu_count=_positive_integer(spec, "gpu_count"),
             container_disk_gb=_positive_integer(spec, "container_disk_gb"),
-            volume_gb=_positive_integer(spec, "volume_gb"),
+            volume_gb=volume_gb,
             volume_mount_path=_required_string(spec, "volume_mount_path"),
             ports=_string_tuple(spec.get("ports"), "ports"),
             environment=environment,
             terminate_at=_required_string(spec, "terminate_at"),
+            network_volume_id=network_volume_id,
         )
         maximum_rate = _required_decimal(spec, "max_hourly_rate_usd")
         self._persist_maximum_rate(request.operation_id, maximum_rate)
         self._persist_operation_text(request.operation_id, "resource-name", request.resource_name)
         self._persist_operation_text(request.operation_id, "run-id", request.run_id)
         self._persist_operation_text(request.operation_id, "expected-image", pod_request.image)
-        volume_key = self._volume_key(request.operation_id)
+        self._persist_operation_text(
+            request.operation_id,
+            "storage-mode",
+            "network-volume" if network_volume_id is not None else "encrypted-pod-volume",
+        )
+        if network_volume_id is not None:
+            self._persist_operation_text(
+                request.operation_id,
+                "expected-network-volume-id",
+                network_volume_id,
+            )
         try:
-            pod = self._api.create_encrypted_pod(pod_request, volume_key=volume_key)
+            if network_volume_id is not None:
+                pod = self._api.create_network_volume_pod(pod_request)
+            else:
+                pod = self._api.create_encrypted_pod(
+                    pod_request,
+                    volume_key=self._volume_key(request.operation_id),
+                )
         except RunPodTransportOutcomeUnknown as error:
             raise ProviderOutcomeUnknown("provision", request.operation_id) from error
         except SecurityInvariantError as error:
@@ -537,7 +647,9 @@ class RunPodProvider:
         )
 
     def current_spend_usd_per_hour(self, resource_id: str | None) -> Decimal:
-        del resource_id
+        if resource_id is not None:
+            resource = self.get(resource_id)
+            return Decimal("0") if resource is None else resource.hourly_rate_usd
         try:
             spend = self._api.current_spend_per_hour()
         except ProviderProtocolError as error:
@@ -643,10 +755,30 @@ class RunPodProvider:
         return _required_decimal({"maximum": value}, "maximum")
 
     def _checked_observation(self, pod: PodObservation, operation_id: str) -> PodObservation:
-        if pod.volume_encrypted is not True:
-            self._delete_rejected_pod(
-                pod.id, "RunPod reconciliation could not prove encrypted storage"
+        try:
+            storage_mode = self._read_operation_text(operation_id, "storage-mode")
+        except InternalProviderProtocolError:
+            if (self._secrets_root / operation_id / "volume-key").is_file():
+                storage_mode = "encrypted-pod-volume"
+            else:
+                raise
+        if storage_mode == "encrypted-pod-volume":
+            if pod.volume_encrypted is not True:
+                self._delete_rejected_pod(
+                    pod.id, "RunPod reconciliation could not prove encrypted storage"
+                )
+        elif storage_mode == "network-volume":
+            expected_network_volume_id = self._read_operation_text(
+                operation_id,
+                "expected-network-volume-id",
             )
+            if pod.network_volume_id != expected_network_volume_id:
+                self._delete_rejected_pod(
+                    pod.id,
+                    "RunPod reconciliation could not prove the requested network volume attachment",
+                )
+        else:
+            self._delete_rejected_pod(pod.id, "RunPod storage policy is invalid")
         maximum_rate = self._read_maximum_rate(operation_id)
         if pod.cost_per_hour is None:
             self._delete_rejected_pod(pod.id, "RunPod pod has no hourly rate")

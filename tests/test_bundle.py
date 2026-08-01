@@ -132,9 +132,61 @@ def test_check_returns_immutable_normalized_bundle(tmp_path: Path) -> None:
         },
         "heartbeat_interval_seconds": 5,
         "termination_grace_seconds": 10,
+        "artifact_path_base": "run-root",
         "storage": {"encrypted": True, "mount": "/workspace", "required_gb": 10},
         "artifact_manifest_path": "artifacts/manifest.json",
     }
+
+
+def test_existing_network_volume_is_preserved_in_the_run_request(tmp_path: Path) -> None:
+    spec, manifest = _write_bundle(tmp_path)
+    spec["resources"]["storage"] = {
+        "encrypted": False,
+        "network_volume_id": "network-volume-123",
+        "mount": "/workspace",
+        "required_gb": 200,
+    }
+    _rewrite_spec(tmp_path, spec, manifest)
+
+    bundle = check_bundle(tmp_path)
+
+    assert bundle.storage.network_volume_id == "network-volume-123"
+    assert bundle.to_run_request("run-network-volume")["storage"] == {
+        "encrypted": False,
+        "network_volume_id": "network-volume-123",
+        "mount": "/workspace",
+        "required_gb": 200,
+    }
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        {"encrypted": False, "mount": "/workspace", "required_gb": 10},
+        {
+            "encrypted": True,
+            "network_volume_id": "network-volume-123",
+            "mount": "/workspace",
+            "required_gb": 10,
+        },
+        {
+            "encrypted": False,
+            "network_volume_id": "   ",
+            "mount": "/workspace",
+            "required_gb": 10,
+        },
+    ],
+)
+def test_storage_rejects_ambiguous_or_missing_network_volume_identity(
+    tmp_path: Path,
+    storage: dict[str, object],
+) -> None:
+    spec, manifest = _write_bundle(tmp_path)
+    spec["resources"]["storage"] = storage
+    _rewrite_spec(tmp_path, spec, manifest)
+
+    with pytest.raises(BundleValidationError, match="storage"):
+        check_bundle(tmp_path)
 
 
 def test_tag_only_image_is_rejected(tmp_path: Path) -> None:

@@ -26,6 +26,9 @@ from runpod_jobrunner.incremental_ack import (
     sign_ack,
     verify_ack,
 )
+from runpod_jobrunner.incremental_ack import (
+    receipt_key as incremental_ack_receipt_key,
+)
 from runpod_jobrunner.launch_authorization import (
     LaunchAuthorizationError,
     parse_launch_authorization,
@@ -136,7 +139,10 @@ class RunPodRemoteExecutor:
         run_id = _required_string(remote, "run_id")
         resource_id = _resource_id(run_dir)
         deadline = _deadline(_mapping(request.get("provider"), "request.provider"))
-        pod = self._wait_for_connectivity(resource_id, deadline)
+        try:
+            pod = self._wait_for_connectivity(resource_id, deadline, remote)
+        except ApplicationError as error:
+            return _failed(f"provider storage attestation failed: {error}")
         if pod is None:
             return _failed("provider resource disappeared before remote delivery")
         assert pod.public_ip is not None and pod.port_mappings is not None
@@ -375,6 +381,7 @@ class RunPodRemoteExecutor:
             raise ApplicationError(str(error)) from error
         storage = _mapping(remote.get("storage"), "remote.storage")
         storage_mount = PurePosixPath(_required_string(storage, "mount"))
+        remote_run_root = _remote_artifact_root(remote, storage_mount)
         required_gb = storage.get("required_gb")
         if (
             isinstance(required_gb, bool)
@@ -386,7 +393,7 @@ class RunPodRemoteExecutor:
             required_gb * 1_000_000_000,
             _MAX_INCREMENTAL_TOTAL_BYTES,
         )
-        discovery_root = storage_mount
+        discovery_root = remote_run_root
         if discovery.fixed_prefix:
             discovery_root /= discovery.fixed_prefix
         manifests = transfer.discover(
@@ -409,7 +416,7 @@ class RunPodRemoteExecutor:
                 )
             self._mirror_incremental_manifest(
                 transfer,
-                storage_mount,
+                remote_run_root,
                 manifest,
                 remote,
                 controller,
@@ -420,7 +427,7 @@ class RunPodRemoteExecutor:
     def _mirror_incremental_manifest(
         self,
         transfer: _Transfer,
-        storage_mount: PurePosixPath,
+        remote_run_root: PurePosixPath,
         remote_manifest: RemoteFile,
         remote: Mapping[str, object],
         controller: Mapping[str, object],
@@ -459,7 +466,7 @@ class RunPodRemoteExecutor:
         ) as manifest_staging_text:
             manifest_staging = Path(manifest_staging_text)
             fetched = transfer.fetch(
-                storage_mount.as_posix(), manifest_staging, remote_manifest
+                remote_run_root.as_posix(), manifest_staging, remote_manifest
             )
             fetched_path = manifest_staging.joinpath(*manifest_relative.parts)
             try:
@@ -522,7 +529,7 @@ class RunPodRemoteExecutor:
             ) as payload_staging_text:
                 payload_staging = Path(payload_staging_text)
                 transfer.download(
-                    (storage_mount / manifest_relative.parent).as_posix(),
+                    (remote_run_root / manifest_relative.parent).as_posix(),
                     payload_staging,
                     entries,
                 )
@@ -578,12 +585,25 @@ class RunPodRemoteExecutor:
             raise ApplicationError("incremental acknowledgement signer differs from run request")
         receipt_bytes = receipt_path.read_bytes()
         entries = _mapping_sequence(receipt.get("files"), "incremental mirror receipt files")
+        manifest_relative = _incremental_relative(
+            _required_string(receipt, "manifest_path")
+        )
+        storage_manifest_path = manifest_relative.as_posix()
+        if remote.get("artifact_path_base") == "run-root":
+            storage_manifest_path = (
+                PurePosixPath("runpod-jobrunner")
+                / "runs"
+                / _required_string(remote, "run_id")
+                / manifest_relative
+            ).as_posix()
+        elif remote.get("artifact_path_base") is not None:
+            raise ApplicationError("remote artifact path base is unsupported")
         unsigned: dict[str, object] = {
             "protocol": ACK_PROTOCOL,
             "run_id": remote.get("run_id"),
             "bundle_hash": remote.get("bundle_hash"),
             "image_digest": remote.get("image_digest"),
-            "manifest_path": receipt.get("manifest_path"),
+            "manifest_path": storage_manifest_path,
             "manifest_size": receipt.get("remote_size"),
             "manifest_sha256": receipt.get("manifest_sha256"),
             "file_count": len(entries),
@@ -594,7 +614,8 @@ class RunPodRemoteExecutor:
         ack_root = _ensure_private_directory(
             run_dir / "receipts" / "incremental-acks", anchor=run_dir
         )
-        ack_name = f"{receipt_key_value}.json"
+        ack_key = incremental_ack_receipt_key(storage_manifest_path)
+        ack_name = f"{ack_key}.json"
         ack_path = ack_root / ack_name
         if ack_path.exists():
             if ack_path.is_symlink() or not ack_path.is_file():
@@ -665,13 +686,34 @@ class RunPodRemoteExecutor:
             },
         )
 
-    def _wait_for_connectivity(self, resource_id: str, deadline: datetime) -> PodObservation | None:
+    def _wait_for_connectivity(
+        self,
+        resource_id: str,
+        deadline: datetime,
+        remote: Mapping[str, object],
+    ) -> PodObservation | None:
+        storage = _mapping(remote.get("storage"), "remote.storage")
+        encrypted = storage.get("encrypted")
+        expected_network_volume_id = storage.get("network_volume_id")
         while datetime.now(UTC) < deadline:
             pod = self._api.get_pod(resource_id)
             if pod is None:
                 return None
+            if encrypted is False:
+                if (
+                    not isinstance(expected_network_volume_id, str)
+                    or not expected_network_volume_id
+                ):
+                    raise ApplicationError("remote network volume identity is invalid")
+                if pod.network_volume_id != expected_network_volume_id:
+                    raise ApplicationError(
+                        "provider network volume attachment differs from the run request"
+                    )
+                storage_attested = True
+            else:
+                storage_attested = pod.volume_encrypted is True
             if (
-                pod.volume_encrypted is True
+                storage_attested
                 and pod.public_ip
                 and pod.port_mappings is not None
                 and _ssh_port(pod.port_mappings) is not None
@@ -732,12 +774,13 @@ class RunPodRemoteExecutor:
             return ArtifactDisposition.UNAVAILABLE
         storage = _mapping(remote.get("storage"), "remote.storage")
         storage_mount = PurePosixPath(_required_string(storage, "mount"))
+        remote_run_root = _remote_artifact_root(remote, storage_mount)
         manifest_relative = _safe_relative(_required_string(controller, "artifact_manifest_path"))
         manifest_parent = manifest_relative.parent
         manifest_name = manifest_relative.name
         manifest_destination = run_dir / "receipts" / "manifest"
         transfer.download(
-            (storage_mount / manifest_parent).as_posix(),
+            (remote_run_root / manifest_parent).as_posix(),
             manifest_destination,
             [{"path": manifest_name, "size": manifest_size, "sha256": manifest_hash}],
         )
@@ -771,7 +814,7 @@ class RunPodRemoteExecutor:
             )
         artifacts_destination = run_dir / "receipts" / "artifacts"
         transfer.download(
-            (storage_mount / manifest_parent).as_posix(),
+            (remote_run_root / manifest_parent).as_posix(),
             artifacts_destination,
             relative_entries,
         )
@@ -939,9 +982,7 @@ def _enforce_incremental_run_limits(
         for entry in manifest_entries
     )
     if total_bytes > max_total_bytes:
-        raise ApplicationError(
-            "incremental aggregate bytes exceed encrypted storage capacity"
-        )
+        raise ApplicationError("incremental aggregate bytes exceed declared storage capacity")
 
 
 def _available_bytes(path: Path) -> int:
@@ -1232,6 +1273,22 @@ def _safe_relative(value: str) -> PurePosixPath:
     ):
         raise ApplicationError("unsafe remote artifact path")
     return path
+
+
+def _remote_artifact_root(
+    remote: Mapping[str, object], storage_mount: PurePosixPath
+) -> PurePosixPath:
+    path_base = remote.get("artifact_path_base")
+    if path_base is None:
+        return storage_mount
+    if path_base != "run-root":
+        raise ApplicationError("remote artifact path base is unsupported")
+    return (
+        storage_mount
+        / "runpod-jobrunner"
+        / "runs"
+        / _required_string(remote, "run_id")
+    )
 
 
 def _mapping(value: object, name: str) -> dict[str, Any]:

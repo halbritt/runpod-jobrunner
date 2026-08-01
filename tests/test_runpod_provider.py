@@ -124,6 +124,78 @@ def test_create_uses_encryption_key_and_provider_termination() -> None:
     assert b"secret" not in opener.requests[0].data
 
 
+def test_create_attaches_existing_network_volume_without_disk_or_key() -> None:
+    opener = RecordingOpener(
+        [
+            {
+                "data": {
+                    "podFindAndDeployOnDemand": {
+                        "id": "pod-1",
+                        "name": "rj-run-01-create-01",
+                        "desiredStatus": "RUNNING",
+                        "costPerHr": 0.24,
+                        "volumeEncrypted": False,
+                        "networkVolume": {"id": "network-volume-123"},
+                    }
+                }
+            }
+        ]
+    )
+    api = RunPodHTTP("secret", opener=opener)
+    request = replace(
+        create_request(),
+        volume_gb=None,
+        network_volume_id="network-volume-123",
+    )
+
+    pod = api.create_network_volume_pod(request)
+
+    assert pod.network_volume_id == "network-volume-123"
+    sent = json.loads(opener.requests[0].data)
+    values = sent["variables"]["input"]
+    assert values["networkVolumeId"] == "network-volume-123"
+    assert values["terminateAfter"] == "2026-08-01T00:00:00Z"
+    assert "volumeInGb" not in values
+    assert "volumeKey" not in values
+
+
+@pytest.mark.parametrize("observed_id", [None, "wrong-network-volume"])
+def test_network_volume_create_deletes_an_unproven_attachment(
+    observed_id: str | None,
+) -> None:
+    opener = RecordingOpener(
+        [
+            {
+                "data": {
+                    "podFindAndDeployOnDemand": {
+                        "id": "pod-unsafe",
+                        "name": "rj-run-01-create-01",
+                        "desiredStatus": "RUNNING",
+                        "costPerHr": 0.24,
+                        "volumeEncrypted": False,
+                        "networkVolume": (
+                            None if observed_id is None else {"id": observed_id}
+                        ),
+                    }
+                }
+            },
+            None,
+        ]
+    )
+    api = RunPodHTTP("secret", opener=opener)
+    request = replace(
+        create_request(),
+        volume_gb=None,
+        network_volume_id="network-volume-123",
+    )
+
+    with pytest.raises(SecurityInvariantError, match="network volume attachment"):
+        api.create_network_volume_pod(request)
+
+    assert opener.requests[1].method == "DELETE"
+    assert opener.requests[1].full_url.endswith("/pods/pod-unsafe")
+
+
 @pytest.mark.parametrize("key", ["", "x" * 31, "not-a-key"])
 def test_create_rejects_invalid_volume_key_before_network(key: str) -> None:
     opener = RecordingOpener([])
@@ -379,6 +451,29 @@ def test_exact_name_reconciliation_and_spend() -> None:
     }
 
 
+def test_pod_reads_request_and_parse_network_volume_identity() -> None:
+    pod = {
+        "id": "pod-1",
+        "name": "network-volume-pod",
+        "networkVolume": {"id": "network-volume-123"},
+    }
+    opener = RecordingOpener([[pod], pod])
+    api = RunPodHTTP("secret", opener=opener)
+
+    listed = api.list_pods()
+    fetched = api.get_pod("pod-1")
+
+    assert listed[0].network_volume_id == "network-volume-123"
+    assert fetched is not None
+    assert fetched.network_volume_id == "network-volume-123"
+    assert parse_qs(urlsplit(str(opener.requests[0].full_url)).query) == {
+        "includeNetworkVolume": ["true"]
+    }
+    assert parse_qs(urlsplit(str(opener.requests[1].full_url)).query) == {
+        "includeNetworkVolume": ["true"]
+    }
+
+
 @pytest.mark.parametrize("value", [None, "not-money", "NaN", "Infinity", "-0.01"])
 def test_current_spend_rejects_malformed_nonfinite_or_negative_values(value: object) -> None:
     api = RunPodHTTP(
@@ -410,7 +505,9 @@ class FakeAPI:
     def __init__(self) -> None:
         self.pods: dict[str, PodObservation] = {}
         self.created: tuple[PodCreateRequest, str] | None = None
+        self.created_network: PodCreateRequest | None = None
         self.spend = Decimal("0")
+        self.spend_calls = 0
 
     def create_encrypted_pod(self, request: PodCreateRequest, *, volume_key: str) -> PodObservation:
         self.created = (request, volume_key)
@@ -420,6 +517,21 @@ class FakeAPI:
             desired_status="RUNNING",
             cost_per_hour=Decimal("0.24"),
             volume_encrypted=True,
+            image=request.image,
+            environment=request.environment,
+        )
+        self.pods[pod.id] = pod
+        return pod
+
+    def create_network_volume_pod(self, request: PodCreateRequest) -> PodObservation:
+        self.created_network = request
+        pod = PodObservation(
+            id="pod-1",
+            name=request.name,
+            desired_status="RUNNING",
+            cost_per_hour=Decimal("0.24"),
+            volume_encrypted=False,
+            network_volume_id=request.network_volume_id,
             image=request.image,
             environment=request.environment,
         )
@@ -442,6 +554,7 @@ class FakeAPI:
         return self.pods.pop(pod_id, None) is not None
 
     def current_spend_per_hour(self) -> Decimal:
+        self.spend_calls += 1
         return self.spend
 
 
@@ -464,6 +577,14 @@ def provider_request() -> ProviderCreateRequest:
     )
 
 
+def network_provider_request() -> ProviderCreateRequest:
+    request = provider_request()
+    spec = dict(request.spec)
+    del spec["volume_gb"]
+    spec["network_volume_id"] = "network-volume-123"
+    return replace(request, spec=spec)
+
+
 @pytest.mark.parametrize("spend", [Decimal("NaN"), Decimal("Infinity"), Decimal("-0.01")])
 def test_production_adapter_rejects_invalid_current_spend(
     tmp_path: Path, spend: Decimal
@@ -474,6 +595,32 @@ def test_production_adapter_rejects_invalid_current_spend(
 
     with pytest.raises(LifecycleProviderProtocolError, match="spend"):
         provider.current_spend_usd_per_hour(None)
+
+
+def test_production_adapter_scopes_known_resource_spend_to_the_exact_pod(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    api.spend = Decimal("0.029")
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    assert provider.current_spend_usd_per_hour("deleted-pod") == Decimal("0")
+    assert api.spend_calls == 0
+
+    resource = provider.create(network_provider_request())
+    assert provider.current_spend_usd_per_hour(resource.id) == Decimal("0.24")
+    assert api.spend_calls == 0
+
+
+def test_production_adapter_keeps_account_scope_when_no_resource_id_is_known(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    api.spend = Decimal("0.029")
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    assert provider.current_spend_usd_per_hour(None) == Decimal("0.029")
+    assert api.spend_calls == 1
 
 
 def test_production_adapter_creates_encrypted_resource_with_durable_key(tmp_path: Path) -> None:
@@ -492,6 +639,82 @@ def test_production_adapter_creates_encrypted_resource_with_durable_key(tmp_path
     assert key_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_production_adapter_attaches_existing_network_volume_without_a_volume_key(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    request = network_provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    resource = provider.create(request)
+
+    assert resource.state == ProviderResourceState.RUNNING
+    assert api.created is None
+    assert api.created_network is not None
+    assert api.created_network.network_volume_id == "network-volume-123"
+    assert api.created_network.volume_gb is None
+    operation_root = tmp_path / "secrets" / request.operation_id
+    assert not (operation_root / "volume-key").exists()
+
+
+def test_production_adapter_rejects_an_invalid_network_volume_id_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    request = network_provider_request()
+    spec = dict(request.spec)
+    spec["network_volume_id"] = "   "
+    request = replace(request, spec=spec)
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    with pytest.raises(LifecycleProviderProtocolError, match="network_volume_id"):
+        provider.create(request)
+
+    assert api.created is None
+    assert api.created_network is None
+
+
+@pytest.mark.parametrize("observed_id", [None, "wrong-network-volume"])
+def test_network_volume_reconciliation_deletes_unknown_or_mismatched_attachment(
+    tmp_path: Path,
+    observed_id: str | None,
+) -> None:
+    api = FakeAPI()
+    request = network_provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    provider.create(request)
+    api.pods["pod-1"] = replace(api.pods["pod-1"], network_volume_id=observed_id)
+
+    with pytest.raises(ProviderRejected, match="network volume attachment"):
+        provider.find_resources(request.operation_id)
+
+    assert api.pods == {}
+
+
+@pytest.mark.parametrize("invalid_first", [True, False])
+def test_network_volume_reconciliation_reports_every_mixed_duplicate(
+    tmp_path: Path,
+    invalid_first: bool,
+) -> None:
+    api = FakeAPI()
+    request = network_provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    provider.create(request)
+    api.pods["pod-2"] = replace(api.pods["pod-1"], id="pod-2")
+    invalid_id = "pod-1" if invalid_first else "pod-2"
+    api.pods[invalid_id] = replace(
+        api.pods[invalid_id],
+        network_volume_id="wrong-network-volume",
+    )
+
+    with pytest.raises(ProviderRejected, match="network volume attachment") as caught:
+        provider.find_resources(request.operation_id)
+
+    assert caught.value.resource_ids == ("pod-1", "pod-2")
+    assert invalid_id not in api.pods
+    assert set(api.pods) == ({"pod-2"} if invalid_first else {"pod-1"})
+
+
 def test_production_adapter_reconciles_by_operation_environment(tmp_path: Path) -> None:
     api = FakeAPI()
     provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
@@ -500,6 +723,19 @@ def test_production_adapter_reconciles_by_operation_environment(tmp_path: Path) 
     matches = provider.find_resources(provider_request().operation_id)
 
     assert matches == (created,)
+
+
+def test_encrypted_resource_reconciliation_accepts_pre_storage_mode_state(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    request = provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+    created = provider.create(request)
+    storage_mode = tmp_path / "secrets" / request.operation_id / "storage-mode"
+    storage_mode.unlink()
+
+    assert provider.find_resources(request.operation_id) == (created,)
 
 
 def test_production_adapter_returns_duplicate_matches_without_changing_primary_resource(
@@ -574,6 +810,26 @@ def test_production_adapter_maps_unknown_create_outcome(tmp_path: Path) -> None:
         provider.create(provider_request())
 
     assert caught.value.operation_id == provider_request().operation_id
+
+
+def test_network_volume_unknown_create_is_reconciled_without_a_second_create(
+    tmp_path: Path,
+) -> None:
+    class UnknownNetworkAPI(FakeAPI):
+        def create_network_volume_pod(self, request: PodCreateRequest) -> PodObservation:
+            super().create_network_volume_pod(request)
+            raise RunPodTransportOutcomeUnknown("POST")
+
+    api = UnknownNetworkAPI()
+    request = network_provider_request()
+    provider = RunPodProvider(api, secrets_root=tmp_path / "secrets")
+
+    with pytest.raises(ProviderOutcomeUnknown):
+        provider.create(request)
+
+    matches = provider.find_resources(request.operation_id)
+    assert tuple(resource.id for resource in matches) == ("pod-1",)
+    assert api.created_network is not None
 
 
 def test_production_adapter_maps_post_dispatch_protocol_error_to_unknown(

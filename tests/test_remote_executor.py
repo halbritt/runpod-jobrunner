@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from email.message import Message
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -53,6 +54,22 @@ class FakeAPI:
                 "RUNPOD_JOBRUNNER_RUN_ID": "run-remote",
                 "RUNPOD_JOBRUNNER_OPERATION_ID": "op-create",
             },
+        )
+
+
+class FakeNetworkVolumeAPI:
+    def get_pod(self, pod_id: str) -> PodObservation:
+        observation = FakeAPI().get_pod(pod_id)
+        return PodObservation(
+            id=observation.id,
+            name=observation.name,
+            desired_status=observation.desired_status,
+            cost_per_hour=observation.cost_per_hour,
+            volume_encrypted=False,
+            network_volume_id="volume-existing",
+            public_ip=observation.public_ip,
+            port_mappings=observation.port_mappings,
+            environment=observation.environment,
         )
 
 
@@ -127,6 +144,7 @@ def make_request(
     incremental: bool = False,
     ack_signer: AckSigner | None = None,
     storage_gb: int = 10,
+    network_volume_id: str | None = None,
 ) -> dict[str, object]:
     input_root = tmp_path / "inputs"
     input_root.mkdir()
@@ -165,10 +183,16 @@ def make_request(
             },
             "heartbeat_interval_seconds": 5,
             "termination_grace_seconds": 10,
+            "artifact_path_base": "run-root",
             "storage": {
-                "encrypted": True,
+                "encrypted": network_volume_id is None,
                 "mount": "/workspace",
                 "required_gb": storage_gb,
+                **(
+                    {"network_volume_id": network_volume_id}
+                    if network_volume_id is not None
+                    else {}
+                ),
             },
             "artifact_manifest_path": "artifacts/manifest.json",
             "launch_authorization": {
@@ -200,13 +224,22 @@ def make_request(
 def write_incremental_checkpoint(
     remote: Path,
     *,
+    run_id: str = "run-remote",
     checkpoint: str = "checkpoint-25",
     payload: bytes = b"checkpoint state\n",
     declared_path: str = "trainer_state.json",
     declared_hash: str | None = None,
     declared_size: int | None = None,
 ) -> Path:
-    checkpoint_root = remote / "workspace" / "checkpoints" / checkpoint
+    checkpoint_root = (
+        remote
+        / "workspace"
+        / "runpod-jobrunner"
+        / "runs"
+        / run_id
+        / "checkpoints"
+        / checkpoint
+    )
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     file_path = checkpoint_root / "trainer_state.json"
     file_path.write_bytes(payload)
@@ -228,7 +261,15 @@ def write_incremental_checkpoint(
 
 def write_terminal_artifact(remote: Path) -> tuple[bytes, dict[str, object]]:
     artifact = b"verified output\n"
-    artifact_path = remote / "workspace" / "artifacts" / "result.bin"
+    artifact_path = (
+        remote
+        / "workspace"
+        / "runpod-jobrunner"
+        / "runs"
+        / "run-remote"
+        / "artifacts"
+        / "result.bin"
+    )
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_bytes(artifact)
     manifest = {
@@ -556,7 +597,15 @@ def test_remote_executor_uses_status_truth_and_recovers_exact_artifacts(tmp_path
     run_dir = prepare_run_dir(tmp_path)
     remote = tmp_path / "remote"
     artifact = b"verified output\n"
-    artifact_path = remote / "workspace" / "artifacts" / "result.bin"
+    artifact_path = (
+        remote
+        / "workspace"
+        / "runpod-jobrunner"
+        / "runs"
+        / "run-remote"
+        / "artifacts"
+        / "result.bin"
+    )
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_bytes(artifact)
     manifest = {
@@ -571,7 +620,7 @@ def test_remote_executor_uses_status_truth_and_recovers_exact_artifacts(tmp_path
         ],
     }
     manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    manifest_path = remote / "workspace" / "artifacts" / "manifest.json"
+    manifest_path = artifact_path.parent / "manifest.json"
     manifest_path.write_bytes(manifest_bytes)
     transfer = FakeTransfer(remote)
     ssh_attempts: list[tuple[str, int]] = []
@@ -618,6 +667,108 @@ def test_remote_executor_uses_status_truth_and_recovers_exact_artifacts(tmp_path
     assert (run_dir / "receipts/launch/authorization-publication.json").is_file()
     assert (run_dir / "receipts" / "artifacts" / "result.bin").read_bytes() == artifact
     assert "run-token" not in (run_dir / "remote-status.json").read_text()
+
+
+def test_remote_executor_accepts_the_attested_existing_network_volume(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    artifact, terminal = write_terminal_artifact(remote)
+    transfer = FakeTransfer(remote)
+    executor = RunPodRemoteExecutor(
+        FakeNetworkVolumeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=status_sequence(iter((ready_status(), remote_status(terminal)))),
+        sleep=lambda _seconds: None,
+    )
+
+    observation = executor.execute(
+        make_request(tmp_path, network_volume_id="volume-existing"),
+        run_dir,
+    )
+
+    assert observation.result == WorkloadResult.SUCCEEDED
+    assert (run_dir / "receipts/artifacts/result.bin").read_bytes() == artifact
+
+
+def test_remote_executor_fails_closed_on_an_unexpected_network_volume(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    executor = RunPodRemoteExecutor(
+        FakeNetworkVolumeAPI(),
+        ssh_key_file=tmp_path / "key",
+        sleep=lambda _seconds: None,
+    )
+
+    observation = executor.execute(
+        make_request(tmp_path, network_volume_id="different-volume"),
+        run_dir,
+    )
+
+    assert observation.result == WorkloadResult.FAILED
+    assert observation.disposition == ArtifactDisposition.UNAVAILABLE
+    assert "network volume attachment differs" in observation.detail
+
+
+def test_terminal_recovery_does_not_reuse_a_sibling_runs_stale_manifest(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    _artifact, terminal = write_terminal_artifact(remote)
+    runs_root = remote / "workspace" / "runpod-jobrunner" / "runs"
+    (runs_root / "run-remote").rename(runs_root / "run-stale")
+    transfer = FakeTransfer(remote)
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=status_sequence(iter((ready_status(), remote_status(terminal)))),
+        sleep=lambda _seconds: None,
+    )
+
+    observation = executor.execute(make_request(tmp_path), run_dir)
+
+    assert observation.result == WorkloadResult.FAILED
+    assert observation.disposition == ArtifactDisposition.UNAVAILABLE
+    assert observation.detail.startswith("terminal artifact recovery failed:")
+
+
+def test_controller_recovery_defaults_an_old_request_to_storage_root_artifacts(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    artifact, terminal = write_terminal_artifact(remote)
+    new_artifacts = (
+        remote / "workspace/runpod-jobrunner/runs/run-remote/artifacts"
+    )
+    legacy_artifacts = remote / "workspace/artifacts"
+    legacy_artifacts.parent.mkdir(parents=True, exist_ok=True)
+    new_artifacts.rename(legacy_artifacts)
+    transfer = FakeTransfer(remote)
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=status_sequence(iter((ready_status(), remote_status(terminal)))),
+        sleep=lambda _seconds: None,
+    )
+    request = make_request(tmp_path)
+    remote_request = cast(dict[str, object], request["remote"])
+    remote_request.pop("artifact_path_base")
+
+    observation = executor.execute(request, run_dir)
+
+    assert observation.result == WorkloadResult.SUCCEEDED
+    assert (run_dir / "receipts/artifacts/result.bin").read_bytes() == artifact
+    assert "/workspace/artifacts" in transfer.downloads
 
 
 def test_controller_restart_after_inputs_before_token_does_not_reupload_inputs(
@@ -807,7 +958,10 @@ def test_permanent_terminal_manifest_error_fails_with_unavailable_artifacts(
     remote = tmp_path / "remote"
     _artifact, terminal = write_terminal_artifact(remote)
     invalid = b"not JSON\n"
-    (remote / "workspace/artifacts/manifest.json").write_bytes(invalid)
+    (
+        remote
+        / "workspace/runpod-jobrunner/runs/run-remote/artifacts/manifest.json"
+    ).write_bytes(invalid)
     terminal["artifact_manifest_sha256"] = digest(invalid)
     terminal["artifact_manifest_size"] = len(invalid)
     transfer = FakeTransfer(remote)
@@ -934,10 +1088,49 @@ def test_incremental_checkpoint_is_mirrored_before_remote_terminal(
         run_dir / "receipts/incremental/checkpoints/checkpoint-25/checkpoint-complete.json"
     ).is_file()
     assert transfer.discovery_requests == [
-        ("/workspace/checkpoints", "checkpoint-*/checkpoint-complete.json"),
-        ("/workspace/checkpoints", "checkpoint-*/checkpoint-complete.json"),
+        (
+            "/workspace/runpod-jobrunner/runs/run-remote/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+        ),
+        (
+            "/workspace/runpod-jobrunner/runs/run-remote/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+        ),
     ]
     assert "checkpoints/" not in (run_dir / "remote-status.json").read_text()
+
+
+def test_incremental_discovery_ignores_a_sibling_runs_stale_completion(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    write_incremental_checkpoint(remote, run_id="run-stale")
+    _artifact, terminal = write_terminal_artifact(remote)
+    transfer = FakeTransfer(remote)
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=status_sequence(iter((remote_status(), remote_status(terminal)))),
+        sleep=lambda _seconds: None,
+    )
+
+    observation = executor.execute(make_request(tmp_path, incremental=True), run_dir)
+
+    assert observation.result == WorkloadResult.SUCCEEDED
+    assert not (run_dir / "receipts/incremental/checkpoints").exists()
+    assert transfer.discovery_requests == [
+        (
+            "/workspace/runpod-jobrunner/runs/run-remote/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+        ),
+        (
+            "/workspace/runpod-jobrunner/runs/run-remote/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+        ),
+    ]
 
 
 def test_incremental_ack_is_signed_published_and_reconciled_after_unknown_upload(
@@ -991,7 +1184,10 @@ def test_incremental_ack_is_signed_published_and_reconciled_after_unknown_upload
 
     assert observation.result == WorkloadResult.SUCCEEDED
     assert transfer.ack_upload_attempts == 1
-    manifest_path = "checkpoints/checkpoint-25/checkpoint-complete.json"
+    manifest_path = (
+        "runpod-jobrunner/runs/run-remote/"
+        "checkpoints/checkpoint-25/checkpoint-complete.json"
+    )
     ack_name = hashlib.sha256(manifest_path.encode()).hexdigest() + ".json"
     remote_ack = (
         remote

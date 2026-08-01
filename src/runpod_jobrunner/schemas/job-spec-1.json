@@ -92,14 +92,30 @@
           "type": "object",
           "required": ["encrypted", "mount", "required_gb"],
           "properties": {
-            "encrypted": {"const": true},
+            "encrypted": {"type": "boolean"},
+            "network_volume_id": {
+              "type": "string",
+              "pattern": "^(?=.*\\S)[^\\u0000\\r\\n]+$"
+            },
             "mount": {
               "type": "string",
               "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$"
             },
             "required_gb": {"type": "integer", "minimum": 1}
           },
-          "additionalProperties": true
+          "additionalProperties": true,
+          "oneOf": [
+            {
+              "properties": {
+                "encrypted": {"const": true},
+                "network_volume_id": false
+              }
+            },
+            {
+              "required": ["network_volume_id"],
+              "properties": {"encrypted": {"const": false}}
+            }
+          ]
         }
       },
       "additionalProperties": true

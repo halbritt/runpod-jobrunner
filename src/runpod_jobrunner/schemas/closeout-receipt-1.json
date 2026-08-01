@@ -48,6 +48,46 @@
         "delete_already_absent": {"type": "boolean"},
         "provider_not_found": {"const": true},
         "current_spend_usd_per_hour": {"const": "0"},
+        "current_spend_scope": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": {"kind": {"const": "account"}},
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["kind", "resource_id"],
+              "properties": {
+                "kind": {"const": "resource"},
+                "resource_id": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["kind", "operation_id", "proof"],
+              "properties": {
+                "kind": {"const": "provision_operation"},
+                "operation_id": {"type": "string", "minLength": 1},
+                "proof": {
+                  "enum": ["provision_not_dispatched", "termination_deadline_absence"]
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["kind", "proof"],
+              "properties": {
+                "kind": {"const": "run"},
+                "proof": {"const": "provision_not_dispatched"}
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
         "delete_acknowledged_resource_ids": {
           "type": "array",
           "items": {"type": "string", "minLength": 1},

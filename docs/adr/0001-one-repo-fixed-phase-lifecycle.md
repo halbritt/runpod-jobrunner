@@ -49,10 +49,28 @@ The local controller owns lifecycle closure. The remote runner owns workload
 process truth and publishes a token-protected read-only status record independent
 of SSH. The runner has no provider-management credential.
 
-Private inputs and working artifacts require encrypted pod storage. The upload
-contains only files declared by an exact size-and-SHA-256 manifest. A lifecycle
-is closed only after artifact disposition, delete acknowledgement, provider
-not-found, and zero-current-spend observations are recorded.
+Private inputs and working artifacts require encrypted pod storage. A job whose
+data policy permits unencrypted storage may instead name one existing RunPod
+network volume. The controller must attach that exact provider ID, must not
+request a pod volume disk, and must reject an absent or different attachment
+during creation and reconciliation. The upload contains only files declared by
+an exact size-and-SHA-256 manifest. A lifecycle is closed only after artifact
+disposition, Pod delete acknowledgement, provider not-found, and zero-current-spend
+observations are recorded. An existing network volume remains outside the run's
+deletion lifecycle.
+
+Artifact declarations are namespaced to
+`<mount>/runpod-jobrunner/runs/<run_id>`. Terminal manifest paths, terminal file
+paths, and incremental discovery globs cannot resolve from the shared mount or a
+sibling run. Signed incremental acknowledgements keep their established
+storage-mount-relative manifest binding, including the run namespace prefix.
+
+For a known Pod ID, closeout uses an exact-resource spend observation rather than
+RunPod's account-wide spend total. This keeps retained network-volume charges and
+unrelated workloads outside the run's teardown proof. Account scope remains the
+conservative fallback when no Pod ID was established, except that a network-volume
+create may use provision-operation scope after its provider deadline and bounded
+absence proof are complete. The selected scope is durable receipt evidence.
 
 ## Consequences
 
@@ -81,4 +99,3 @@ remote runner broad provider credentials.
 - the first two real training jobs cannot fit the fixed phase protocol;
 - RunPod operations cannot be reconciled by stable run identity;
 - authenticated status or verified deletion cannot be established.
-

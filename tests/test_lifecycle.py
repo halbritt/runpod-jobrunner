@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +21,8 @@ from runpod_jobrunner.provider import (
     ProviderCreateRequest,
     ProviderOutcomeUnknown,
     ProviderRejected,
+    ProviderResource,
+    ProviderResourceState,
 )
 from runpod_jobrunner.run_store import RunStore, RunTransaction
 
@@ -342,6 +345,7 @@ def test_no_effect_create_closes_only_after_deadline_and_fresh_absence_across_re
     clock = Clock()
     store = RunStore(tmp_path / "runs")
     provider = MemoryRunPod()
+    provider.forced_current_spend_usd_per_hour = Decimal("0.029")
     controller = LifecycleController(
         store,
         provider,
@@ -352,7 +356,10 @@ def test_no_effect_create_closes_only_after_deadline_and_fresh_absence_across_re
         "run-no-effect",
         {
             "job": "noop",
-            "provider": {"terminate_at": "2026-07-31T00:00:20Z"},
+            "provider": {
+                "terminate_at": "2026-07-31T00:00:20Z",
+                "network_volume_id": "retained-volume",
+            },
         },
         approved_max_usd="1",
     )
@@ -401,10 +408,30 @@ def test_no_effect_create_closes_only_after_deadline_and_fresh_absence_across_re
     }
     restarted.reconcile("run-no-effect")
     restarted.reconcile("run-no-effect")
+    with store.transaction("run-no-effect") as transaction:
+        tampered = transaction.current_state()
+        tampered["closeout"]["current_spend_scope"] = {
+            "kind": "provision_operation",
+            "operation_id": "wrong-operation",
+            "proof": "termination_deadline_absence",
+        }
+        transaction.commit_state("tampered_spend_scope_fixture", tampered)
+    with pytest.raises(LifecycleConflictError, match="current spend scope differs"):
+        restarted.reconcile("run-no-effect")
+    with store.transaction("run-no-effect") as transaction:
+        restored = transaction.current_state()
+        restored["closeout"]["current_spend_scope"] = None
+        transaction.commit_state("restored_spend_scope_fixture", restored)
     closed = restarted.reconcile("run-no-effect")
 
     assert closed["lifecycle"] == LifecycleState.CLOSED
     assert closed["closeout"]["delete_already_absent"] is True
+    assert closed["closeout"]["current_spend_usd_per_hour"] == "0"
+    assert closed["closeout"]["current_spend_scope"] == {
+        "kind": "provision_operation",
+        "operation_id": operation_id,
+        "proof": "termination_deadline_absence",
+    }
     assert provider.effects == []
 
 
@@ -560,7 +587,83 @@ def test_failed_workload_can_close_but_result_is_not_lifecycle_state(tmp_path: P
     assert closed["lifecycle"] == LifecycleState.CLOSED
     assert closed["workload_result"] == WorkloadResult.FAILED
     assert closed["closeout"]["current_spend_usd_per_hour"] == "0"
+    assert closed["closeout"]["current_spend_scope"] == {
+        "kind": "resource",
+        "resource_id": "memory-pod-000001",
+    }
     assert [effect.kind for effect in provider.effects][-1] == "delete"
+
+
+def test_unrelated_account_spend_does_not_block_resource_scoped_closeout(
+    tmp_path: Path,
+) -> None:
+    controller, _, provider = make_controller(tmp_path)
+    reach_running(controller)
+    unrelated = ProviderResource(
+        id="unrelated-pod",
+        run_id="another-run",
+        create_operation_id="another-operation",
+        name="unrelated",
+        state=ProviderResourceState.RUNNING,
+        hourly_rate_usd=Decimal("0.029"),
+    )
+    provider.resources[unrelated.id] = unrelated
+    controller.record_workload_result("run-1", WorkloadResult.SUCCEEDED)
+    controller.record_artifact_disposition("run-1", ArtifactDisposition.VERIFIED)
+    controller.reconcile("run-1")
+    controller.reconcile("run-1")
+
+    closed = controller.reconcile("run-1")
+
+    assert closed["lifecycle"] == LifecycleState.CLOSED
+    assert closed["closeout"]["current_spend_usd_per_hour"] == "0"
+    assert closed["closeout"]["current_spend_scope"] == {
+        "kind": "resource",
+        "resource_id": "memory-pod-000001",
+    }
+    assert provider.resources[unrelated.id] == unrelated
+
+
+@pytest.mark.parametrize("provision_intended", [False, True])
+def test_network_volume_stop_before_create_uses_no_dispatch_spend_proof(
+    tmp_path: Path,
+    provision_intended: bool,
+) -> None:
+    controller, _, provider = make_controller(tmp_path)
+    provider.forced_current_spend_usd_per_hour = Decimal("0.029")
+    controller.plan(
+        "run-before-create",
+        {
+            "provider": {
+                "terminate_at": "2026-08-01T00:10:00Z",
+                "network_volume_id": "retained-volume",
+            }
+        },
+        approved_max_usd="1",
+    )
+    operation_id = None
+    if provision_intended:
+        intended = controller.reconcile("run-before-create")
+        operation_id = intended["operations"]["provision"]["id"]
+    controller.request_stop("run-before-create", reason="operator stop before create")
+
+    state = controller.status("run-before-create")
+    for _ in range(4):
+        if state["lifecycle"] == LifecycleState.CLOSED:
+            break
+        state = controller.reconcile("run-before-create")
+
+    assert state["lifecycle"] == LifecycleState.CLOSED
+    expected_scope = (
+        {"kind": "run", "proof": "provision_not_dispatched"}
+        if operation_id is None
+        else {
+            "kind": "provision_operation",
+            "operation_id": operation_id,
+            "proof": "provision_not_dispatched",
+        }
+    )
+    assert state["closeout"]["current_spend_scope"] == expected_scope
 
 
 def test_nonzero_current_spend_prevents_closeout(tmp_path: Path) -> None:
@@ -707,6 +810,66 @@ def test_rejected_resource_found_after_unknown_create_never_creates_again(
     assert deleting["lifecycle"] == LifecycleState.DELETING
     assert deleting["resource"] == {"id": "memory-pod-000001"}
     assert [effect.kind for effect in provider.effects].count("provision") == 1
+
+
+def test_mixed_rejected_duplicates_are_all_quarantined_and_deleted(
+    tmp_path: Path,
+) -> None:
+    class MixedRejectedProvider(MemoryRunPod):
+        reject_once = True
+
+        def find_resources(self, create_operation_id: str):  # type: ignore[no-untyped-def]
+            if self.reject_once:
+                self.reject_once = False
+                raise ProviderRejected(
+                    "one duplicate has the wrong network volume",
+                    resource_id="invalid-pod",
+                    resource_ids=("invalid-pod", "valid-pod"),
+                )
+            return super().find_resources(create_operation_id)
+
+    store = RunStore(tmp_path / "runs")
+    provider = MixedRejectedProvider()
+    provider.resources = {
+        resource_id: ProviderResource(
+            id=resource_id,
+            run_id="run-mixed",
+            create_operation_id="placeholder",
+            name=resource_id,
+            state=ProviderResourceState.RUNNING,
+            hourly_rate_usd=Decimal("0.24"),
+        )
+        for resource_id in ("invalid-pod", "valid-pod")
+    }
+    controller = LifecycleController(store, provider)
+    controller.plan(
+        "run-mixed",
+        {
+            "provider": {
+                "terminate_at": "2026-08-01T00:10:00Z",
+                "network_volume_id": "expected-volume",
+            }
+        },
+        approved_max_usd="1",
+    )
+    intended = controller.reconcile("run-mixed")
+    operation_id = intended["operations"]["provision"]["id"]
+    provider.resources = {
+        key: replace(value, create_operation_id=operation_id)
+        for key, value in provider.resources.items()
+    }
+
+    deleting = controller.reconcile("run-mixed")
+
+    assert deleting["quarantined_resource_ids"] == ["invalid-pod", "valid-pod"]
+    after_first_delete = controller.reconcile("run-mixed")
+    assert after_first_delete["lifecycle"] == LifecycleState.DELETING
+    assert set(provider.resources) == {"valid-pod"}
+    after_second_delete = controller.reconcile("run-mixed")
+    assert after_second_delete["lifecycle"] == LifecycleState.DELETING
+    assert provider.resources == {}
+    assert controller.reconcile("run-mixed")["closeout"]["provider_not_found"] is True
+    assert controller.reconcile("run-mixed")["lifecycle"] == LifecycleState.CLOSED
 
 
 def test_stop_after_unknown_create_adopts_and_deletes_late_resource(tmp_path: Path) -> None:

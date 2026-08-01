@@ -22,7 +22,8 @@ recover only verified artifacts, and remove the billable resource.
 - **terminal record**: the runner's single immutable workload result and final
   artifact-manifest hash.
 - **closeout**: proof of artifact disposition, delete acknowledgement, provider
-  absence, and zero current spend. Only then is the lifecycle `closed`.
+  absence, and zero compute spend in the recorded resource, provision-operation,
+  run, or account scope. Only then is the lifecycle `closed`.
 - **unknown outcome**: an external call whose effect cannot be established. It
   must be reconciled by operation identity before retry.
 
@@ -34,9 +35,14 @@ recover only verified artifacts, and remove the billable resource.
 4. Money is represented as decimal strings; limits can only become tighter.
 5. The remote runner has no provider-management credential.
 6. `closed` is evidence, not a synonym for process exit or delete request.
+7. Storage is either a controller-keyed encrypted pod volume or one exact existing
+   network volume; attachment failure never falls back to local or ephemeral disk.
+8. Declared terminal artifact paths and incremental discovery are relative to the
+   current run root, never the shared mount or a sibling run namespace.
+9. A known Pod closes against exact-resource compute spend; persistent storage or
+   unrelated account spend is not evidence that the Pod still exists.
 
 ## Non-goals
 
 This project is not a scheduler, workflow DAG, model trainer, model registry,
 multi-cloud API, multi-tenant service, or source of model-acceptance decisions.
-

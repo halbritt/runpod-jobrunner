@@ -57,6 +57,7 @@ def make_bundle(
     fail: bool = False,
     incremental_manifest_glob: str | None = None,
     incremental_ack: bool = False,
+    network_volume_id: str | None = None,
 ) -> Path:
     inputs = root / "inputs"
     inputs.mkdir(parents=True)
@@ -69,7 +70,7 @@ def make_bundle(
     }
     artifact_script = (
         "import hashlib,json,os,pathlib;"
-        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_STORAGE_MOUNT']);"
+        "root=pathlib.Path(os.environ['RUNPOD_JOBRUNNER_RUN_ROOT']);"
         "d=root/'artifacts';d.mkdir(parents=True,exist_ok=True);"
         "p=d/'result.txt';p.write_bytes(b'ok\\n');"
         "m={'protocol':'artifact-manifest/1','files':[{'path':'artifacts/result.txt',"
@@ -100,7 +101,16 @@ def make_bundle(
             "gpu_count": 1,
             "container_disk_gb": 10,
             "ports": ["22/tcp", "8080/http"],
-            "storage": {"encrypted": True, "mount": "/workspace", "required_gb": 10},
+            "storage": (
+                {
+                    "encrypted": False,
+                    "network_volume_id": network_volume_id,
+                    "mount": "/workspace",
+                    "required_gb": 10,
+                }
+                if network_volume_id is not None
+                else {"encrypted": True, "mount": "/workspace", "required_gb": 10}
+            ),
         },
         "inputs": {"manifest": "input-manifest.json"},
         "phases": phase_map,
@@ -198,6 +208,60 @@ def test_run_persists_intent_before_launch_and_never_uses_full_approval(tmp_path
         "checkpoints/checkpoint-*/checkpoint-complete.json"
     )
     assert "incremental_manifest_glob" not in request["remote"]
+
+
+def test_run_persists_existing_network_volume_without_requesting_a_volume_disk(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(tmp_path / "bundle", network_volume_id="network-volume-123")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-network-volume",
+    )
+
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+
+    request = store.read_request(run_id)
+    assert request["remote"]["storage"]["network_volume_id"] == "network-volume-123"
+    assert request["provider"]["network_volume_id"] == "network-volume-123"
+    assert "volume_gb" not in request["provider"]
+    assert request["provider"]["volume_mount_path"] == "/workspace"
+
+
+def test_lifecycle_dispatches_the_durable_existing_network_volume_request(
+    tmp_path: Path,
+) -> None:
+    class CapturingProvider(MemoryRunPod):
+        def __init__(self) -> None:
+            super().__init__()
+            self.create_requests: list[ProviderCreateRequest] = []
+
+        def create(self, request: ProviderCreateRequest):  # type: ignore[no-untyped-def]
+            self.create_requests.append(request)
+            return super().create(request)
+
+    bundle = make_bundle(tmp_path / "bundle", network_volume_id="network-volume-123")
+    store = RunStore(tmp_path / "runs")
+    app = JobRunner(
+        store,
+        RecordingSupervisor(store),
+        supervisor_executable=Path("/bin/true"),
+        run_id_factory=lambda: "run-network-dispatch",
+    )
+    run_id = app.run(bundle, approved_max_usd=Decimal("0.50"))
+    provider = CapturingProvider()
+    controller = LifecycleController(store, provider)
+
+    controller.reconcile(run_id)
+    controller.reconcile(run_id)
+
+    assert len(provider.create_requests) == 1
+    dispatched = provider.create_requests[0]
+    assert dispatched.spec["network_volume_id"] == "network-volume-123"
+    assert "volume_gb" not in dispatched.spec
 
 
 def test_run_pins_a_distinct_launch_authorization_without_exposing_its_token(

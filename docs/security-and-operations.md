@@ -15,6 +15,29 @@ status token and launch token are independently generated. Status
 contains identifiers, phase, heartbeat, child state, sequence, and terminal
 result; it contains no logs, paths, input contents, model contents, or secrets.
 
+Storage has two accepted forms. Private data uses controller-keyed encrypted pod
+storage. A job may set `encrypted: false` only when it also declares one non-empty
+`network_volume_id`; this form is for data that the owner permits on that existing
+RunPod network volume. The provider request sends `networkVolumeId`, omits
+`volumeInGb` and `volumeKey`, and retains the provider-side `terminateAfter`
+deadline. Creation and reconciliation query the attached network volume and
+delete the Pod if the ID is absent or differs. Closeout never deletes the existing
+network volume.
+
+RunPod's account-wide current-spend value can include retained network-volume
+storage and unrelated workloads, so it is not teardown evidence for a known Pod.
+When the durable run has a Pod ID, closeout queries that exact Pod and records its
+resource-scoped rate, with zero meaning the Pod is absent. The closeout receipt
+stores `current_spend_scope` with that Pod ID. When no Pod ID was established,
+an existing-network-volume run may use provision-operation scope only after exact
+operation reconciliation, `terminateAfter`, and the fresh absence window have all
+produced the durable `provision_resolution`. Other no-ID cases retain the
+conservative account-wide observation. Provider absence, delete acknowledgement,
+and scoped zero spend remain separate durable proofs.
+A stop before any create dispatch records `provision_not_dispatched` at run or
+provision-operation scope, because the durable operation attempt count itself
+proves that this run started no compute resource.
+
 The launch barrier is restart-safe. Durable input and launch-publication receipts
 prevent a controller restart from widening the input set or minting a second
 authorization. The runner records authorization before phase execution; a restart
@@ -33,7 +56,8 @@ not issue another create merely because a list result is briefly empty. If no
 operation-specific `not_created` receipt exists, an uncertain create cannot close
 until the immutable `terminateAfter` deadline has elapsed and a new five-second
 absence window has passed. Closeout records that deadline proof and still requires
-zero current spend. A pod that becomes visible before then is adopted and deleted.
+zero compute spend in the matching provision-operation scope. A pod that becomes
+visible before then is adopted and deleted.
 Duplicate matches preserve one durable primary identity but all remain visible to
 the deletion loop. Permanent authenticated-status failures become a failed
 workload observation followed by normal deletion instead of a supervisor restart
@@ -69,8 +93,10 @@ runner or returned by the status endpoint.
 
 After each authenticated status observation, the controller uses the run-scoped
 SFTP channel to discover regular completion manifests. Listing starts at the
-glob's longest fixed directory prefix instead of the storage root, and the SFTP
-backend is instructed to skip links. Each manifest must contain a non-empty
+glob's longest fixed directory prefix below
+`<mount>/runpod-jobrunner/runs/<run_id>`, never below the shared storage mount or
+a sibling run, and the SFTP backend is instructed to skip links. Each manifest
+must contain a non-empty
 `files` array of normalized relative paths, exact sizes, and lowercase SHA-256
 hashes. Declared files are confined to the completion manifest's directory and
 mirrored below `receipts/incremental/`.
@@ -85,7 +111,7 @@ contract failures and are never followed or overwritten.
 
 One manifest may declare at most 16,384 files. Durable pending and verified
 receipts count toward per-run limits of 512 manifests and 65,536 files. Aggregate
-declared bytes may not exceed the smaller of the encrypted storage allocation and
+declared bytes may not exceed the smaller of `required_gb` and
 256 GiB. Before each payload transfer, the controller also requires enough local
 free space for the declared payload plus a 1 GiB reserve.
 
@@ -114,10 +140,17 @@ local publication receipt. An unknown upload result is reconciled by discovery
 and exact readback; a conflicting remote acknowledgement is permanent failure.
 Workers must wait only after publishing a closed completion manifest, verify the
 signature and every known binding, and refuse resume from a checkpoint without a
-valid acknowledgement. `ssh-keygen -Y verify` supplies the Ed25519 verifier.
+valid acknowledgement. Although discovery is run-root-relative, the signed
+`manifest_path` is storage-mount-relative and therefore includes
+`runpod-jobrunner/runs/<run_id>/`. `ssh-keygen -Y verify` supplies the Ed25519
+verifier.
 
 Terminal artifact recovery follows the same failure classification: transient
 `TransferUnavailable` observations retry while provider time remains, while
 malformed manifests and permanent transfer contract errors return a failed
 observation so the supervisor proceeds to provider deletion instead of relying
 on a process restart.
+
+The terminal manifest path and every terminal artifact path are also resolved
+only below `<mount>/runpod-jobrunner/runs/<run_id>`. A stale manifest or artifact
+in the storage root or another run namespace cannot be used as current evidence.

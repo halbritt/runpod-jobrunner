@@ -482,7 +482,8 @@ class RemoteRunner:
         assert isinstance(manifest_value, str)
         storage = _mapping(self.request["storage"], "storage")
         storage_root = Path(str(storage["mount"])).resolve()
-        manifest_path = _safe_storage_file(storage_root, manifest_value)
+        run_root = storage_root / "runpod-jobrunner" / "runs" / self.run_id
+        manifest_path = _safe_storage_file(run_root, manifest_value)
         try:
             manifest_size = manifest_path.stat().st_size
         except OSError:
@@ -523,7 +524,7 @@ class RemoteRunner:
             ):
                 raise ArtifactVerificationError("artifact_manifest_invalid")
             seen.add(path_value)
-            artifact_path = _safe_storage_file(storage_root, path_value)
+            artifact_path = _safe_storage_file(run_root, path_value)
             try:
                 actual_size = artifact_path.stat().st_size
             except OSError:
@@ -642,8 +643,22 @@ def _validate_request(request: Mapping[str, object]) -> dict[str, object]:
     except RunnerIdentityError as error:
         raise RequestError(str(error)) from error
     storage = _mapping(request.get("storage"), "storage")
-    if storage.get("encrypted") is not True:
-        raise RequestError("encrypted storage is required")
+    encrypted = storage.get("encrypted")
+    network_volume_id = storage.get("network_volume_id")
+    if encrypted is True:
+        if network_volume_id is not None:
+            raise RequestError("encrypted pod storage cannot declare network_volume_id")
+    elif encrypted is False:
+        if (
+            not isinstance(network_volume_id, str)
+            or not network_volume_id.strip()
+            or any(character in network_volume_id for character in "\x00\r\n")
+        ):
+            raise RequestError(
+                "unencrypted storage requires a non-empty network_volume_id"
+            )
+    else:
+        raise RequestError("storage.encrypted must be boolean")
     mount_path = storage.get("mount")
     if not isinstance(mount_path, str) or not Path(mount_path).is_absolute():
         raise RequestError("storage.mount must be absolute")
@@ -670,6 +685,8 @@ def _validate_request(request: Mapping[str, object]) -> dict[str, object]:
     _positive_number(request.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds")
     _nonnegative_number(request.get("termination_grace_seconds"), "termination_grace_seconds")
     artifact_manifest_path = request.get("artifact_manifest_path")
+    if request.get("artifact_path_base") != "run-root":
+        raise RequestError("artifact_path_base must be run-root")
     if artifact_manifest_path is not None:
         _safe_relative_path(artifact_manifest_path, "artifact_manifest_path")
     acknowledgement = request.get("incremental_mirror_ack")

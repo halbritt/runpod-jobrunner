@@ -393,7 +393,14 @@ class LocalRunnerExecutor:
         terminal = terminal_holder[0]
         outcome = terminal.get("outcome")
         result = WorkloadResult.SUCCEEDED if outcome == "succeeded" else WorkloadResult.FAILED
-        disposition = self._recover_artifacts(controller, local_storage, run_dir, result, terminal)
+        disposition = self._recover_artifacts(
+            remote,
+            controller,
+            local_storage,
+            run_dir,
+            result,
+            terminal,
+        )
         return ExecutionObservation(
             result=result,
             disposition=disposition,
@@ -434,6 +441,7 @@ class LocalRunnerExecutor:
 
     def _recover_artifacts(
         self,
+        remote: Mapping[str, object],
         controller: Mapping[str, object],
         storage_root: Path,
         run_dir: Path,
@@ -443,7 +451,17 @@ class LocalRunnerExecutor:
         manifest_relative = PurePosixPath(_string(controller, "artifact_manifest_path"))
         if manifest_relative.is_absolute() or ".." in manifest_relative.parts:
             raise ApplicationError("artifact manifest path is unsafe")
-        manifest_path = storage_root.joinpath(*manifest_relative.parts)
+        artifact_root = storage_root
+        if remote.get("artifact_path_base") == "run-root":
+            artifact_root = (
+                storage_root
+                / "runpod-jobrunner"
+                / "runs"
+                / _string(remote, "run_id")
+            )
+        elif remote.get("artifact_path_base") is not None:
+            raise ApplicationError("remote artifact path base is unsupported")
+        manifest_path = artifact_root.joinpath(*manifest_relative.parts)
         if not manifest_path.is_file():
             if result == WorkloadResult.SUCCEEDED:
                 raise ApplicationError(
@@ -519,7 +537,11 @@ def _durable_request(
             "gpu_type_id": _first_string(gpu_types, "resources.gpu_types"),
             "gpu_count": resources.get("gpu_count"),
             "container_disk_gb": resources.get("container_disk_gb", 20),
-            "volume_gb": storage.get("required_gb"),
+            **(
+                {"network_volume_id": storage["network_volume_id"]}
+                if storage.get("network_volume_id") is not None
+                else {"volume_gb": storage.get("required_gb")}
+            ),
             "volume_mount_path": storage.get("mount"),
             "ports": resources.get("ports", ["22/tcp", "8080/http"]),
             "terminate_at": terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ"),

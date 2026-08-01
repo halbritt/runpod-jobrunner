@@ -111,6 +111,14 @@ def test_packaged_run_request_schema_accepts_the_current_runner_contract() -> No
     Draft202012Validator.check_schema(schema)
     validate_protocol(record, "run-request/1", subject="request")
 
+    record["storage"] = {
+        "encrypted": False,
+        "network_volume_id": "network-volume-123",
+        "mount": "/workspace",
+        "required_gb": 10,
+    }
+    validate_protocol(record, "run-request/1", subject="request")
+
     record["phases"]["surprise"] = {
         "enabled": True,
         "argv": ["/opt/surprise"],
@@ -214,6 +222,7 @@ def test_run_status_schema_accepts_remote_and_lifecycle_projections() -> None:
             "delete_already_absent": False,
             "provider_not_found": True,
             "current_spend_usd_per_hour": "0",
+            "current_spend_scope": {"kind": "resource", "resource_id": "pod-one"},
             "delete_acknowledged_resource_ids": ["pod-one"],
         },
         "event_sequence": 9,
@@ -266,6 +275,7 @@ def test_closeout_receipt_schema_requires_the_lifecycle_closeout_proof() -> None
             "delete_already_absent": False,
             "provider_not_found": True,
             "current_spend_usd_per_hour": "0",
+            "current_spend_scope": {"kind": "resource", "resource_id": "pod-one"},
         },
         "event_sequence": 9,
     }
@@ -278,6 +288,18 @@ def test_closeout_receipt_schema_requires_the_lifecycle_closeout_proof() -> None
     receipt["closeout"]["current_spend_usd_per_hour"] = "0.01"
     with pytest.raises(ValueError, match="current_spend_usd_per_hour"):
         validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
+
+    receipt["closeout"]["current_spend_usd_per_hour"] = "0"
+    receipt["closeout"]["current_spend_scope"] = {"kind": "resource"}
+    with pytest.raises(ValueError, match="current_spend_scope"):
+        validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
+
+    receipt["closeout"]["current_spend_scope"] = {
+        "kind": "provision_operation",
+        "operation_id": "op-provision",
+        "proof": "termination_deadline_absence",
+    }
+    validate_protocol(receipt, "closeout-receipt/1", subject="receipt")
 
 
 def test_closeout_receipt_requires_deadline_resolution_for_unknown_create() -> None:
@@ -306,6 +328,7 @@ def test_closeout_receipt_requires_deadline_resolution_for_unknown_create() -> N
             "delete_already_absent": True,
             "provider_not_found": True,
             "current_spend_usd_per_hour": "0",
+            "current_spend_scope": {"kind": "account"},
             "provision_absence_confirmed": True,
             "provision_absence_first_observed_at": "2026-07-31T00:10:00Z",
         },
@@ -361,6 +384,7 @@ def test_current_remote_runner_records_conform_to_the_packaged_schemas(tmp_path:
         },
         "heartbeat_interval_seconds": 1,
         "termination_grace_seconds": 1,
+        "artifact_path_base": "run-root",
         "storage": {"encrypted": True, "mount": str(tmp_path), "required_gb": 1},
     }
     status_dir = tmp_path / "status"

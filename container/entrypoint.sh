@@ -31,7 +31,7 @@ for durable_path in "${request_path}" "${status_dir}" "${token_file}"; do
     case "${durable_path}" in
         /workspace/*) ;;
         *)
-            echo "runner state path must be below the encrypted /workspace mount" >&2
+            echo "runner state path must be below the declared /workspace storage mount" >&2
             exit 64
             ;;
     esac

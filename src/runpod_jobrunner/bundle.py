@@ -130,11 +130,12 @@ class InputFile:
 
 @dataclass(frozen=True, slots=True)
 class StorageSpec:
-    """Encrypted persistent storage required before any phase can execute."""
+    """Persistent storage required before any phase can execute."""
 
     encrypted: bool
     mount: str
     required_gb: int
+    network_volume_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,10 +215,16 @@ class JobBundle:
             },
             "heartbeat_interval_seconds": self.heartbeat_interval_seconds,
             "termination_grace_seconds": self.termination_grace_seconds,
+            "artifact_path_base": "run-root",
             "storage": {
                 "encrypted": self.storage.encrypted,
                 "mount": self.storage.mount,
                 "required_gb": self.storage.required_gb,
+                **(
+                    {"network_volume_id": self.storage.network_volume_id}
+                    if self.storage.network_volume_id is not None
+                    else {}
+                ),
             },
         }
         artifacts_value: object = self.job_spec.get("artifacts")
@@ -553,6 +560,7 @@ def check_bundle(bundle_root: str | os.PathLike[str]) -> JobBundle:
             encrypted=storage["encrypted"],
             mount=storage["mount"],
             required_gb=storage["required_gb"],
+            network_volume_id=storage.get("network_volume_id"),
         ),
         input_root=input_root,
         inputs=inputs,

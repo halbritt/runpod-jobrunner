@@ -33,8 +33,16 @@ class ProviderProtocolError(ProviderError):
 class ProviderRejected(ProviderError):
     """A created or discovered resource violated a non-negotiable admission invariant."""
 
-    def __init__(self, message: str, *, resource_id: str | None) -> None:
-        self.resource_id = resource_id
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_id: str | None,
+        resource_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        ids = tuple(dict.fromkeys(resource_ids or (() if resource_id is None else (resource_id,))))
+        self.resource_ids = ids
+        self.resource_id = resource_id or (ids[0] if ids else None)
         super().__init__(message)
 
 

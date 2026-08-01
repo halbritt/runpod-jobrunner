@@ -73,6 +73,8 @@ def test_entrypoint_preserves_ssh_bootstrap_and_has_a_bounded_request_wait() -> 
     assert "--status-port 8080" in entrypoint
     assert "sh -c" not in entrypoint
     assert "RUNPOD_JOBRUNNER_RELEASE_PATH=/opt/runpod-jobrunner/release.json" in entrypoint
+    assert "runner state path must be below the declared /workspace storage mount" in entrypoint
+    assert "encrypted /workspace" not in entrypoint
 
 
 def test_image_embeds_a_full_build_identity_receipt(tmp_path: Path) -> None:
@@ -111,10 +113,12 @@ def test_image_embeds_a_full_build_identity_receipt(tmp_path: Path) -> None:
 def test_noop_package_phase_creates_a_small_content_verified_manifest(
     tmp_path: Path,
 ) -> None:
+    run_root = tmp_path / "runpod-jobrunner/runs/run-container-contract-001"
     environment = os.environ.copy()
     environment.update(
         RUNPOD_JOBRUNNER_RUN_ID="run-container-contract-001",
         RUNPOD_JOBRUNNER_STORAGE_MOUNT=str(tmp_path),
+        RUNPOD_JOBRUNNER_RUN_ROOT=str(run_root),
     )
 
     completed = subprocess.run(
@@ -125,9 +129,9 @@ def test_noop_package_phase_creates_a_small_content_verified_manifest(
         env=environment,
     )
 
-    manifest_path = tmp_path / "artifacts" / "manifest.json"
+    manifest_path = run_root / "artifacts" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    artifact = tmp_path / str(manifest["files"][0]["path"])
+    artifact = run_root / str(manifest["files"][0]["path"])
     assert json.loads(completed.stdout) == {
         "phase": "package",
         "run_id": "run-container-contract-001",
@@ -152,6 +156,9 @@ def test_noop_optional_delay_is_bounded_and_argument_checked(tmp_path: Path) -> 
     environment.update(
         RUNPOD_JOBRUNNER_RUN_ID="run-container-contract-002",
         RUNPOD_JOBRUNNER_STORAGE_MOUNT=str(tmp_path),
+        RUNPOD_JOBRUNNER_RUN_ROOT=str(
+            tmp_path / "runpod-jobrunner/runs/run-container-contract-002"
+        ),
     )
     started = time.monotonic()
     completed = subprocess.run(

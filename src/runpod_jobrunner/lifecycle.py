@@ -105,6 +105,7 @@ class LifecycleController:
                 "delete_already_absent": False,
                 "provider_not_found": False,
                 "current_spend_usd_per_hour": None,
+                "current_spend_scope": None,
             },
         }
         stored_request = copy.deepcopy(dict(request))
@@ -469,13 +470,14 @@ class LifecycleController:
                 try:
                     matches = self.provider.find_resources(provision_operation_id)
                 except ProviderRejected as error:
-                    if error.resource_id is not None:
-                        state["resource"] = {"id": error.resource_id}
+                    if error.resource_ids:
+                        state["quarantined_resource_ids"] = list(error.resource_ids)
+                        state["resource"] = {"id": error.resource_ids[0]}
                         closeout["provision_absence_first_observed_at"] = None
                         return transaction.commit_state(
                             "stopped_rejected_resource_adopted",
                             state,
-                            {"resource_id": error.resource_id},
+                            {"resource_ids": list(error.resource_ids)},
                         )
                     raise
                 if len(matches) > 1:
@@ -493,6 +495,13 @@ class LifecycleController:
                         "stopped_resource_adopted",
                         state,
                         {"resource_id": matches[0].id},
+                    )
+                if provision_attempts == 0:
+                    closeout["provision_absence_confirmed"] = True
+                    return transaction.commit_state(
+                        "stopped_provision_not_dispatched",
+                        state,
+                        {"operation_id": provision_operation_id},
                     )
                 if deadline_resolution_required:
                     termination_deadline_text, termination_deadline = (
@@ -627,10 +636,19 @@ class LifecycleController:
                 "provider_deletion_pending", state, {"resource_id": resource_id}
             )
 
-        spend = self.provider.current_spend_usd_per_hour(resource_id)
+        spend_scope = self._current_spend_scope(state, closeout, resource_id)
+        existing_spend_scope = closeout.get("current_spend_scope")
+        if existing_spend_scope is not None and existing_spend_scope != spend_scope:
+            raise LifecycleConflictError("current spend scope differs from closeout proof")
+        spend = (
+            Decimal("0")
+            if spend_scope["kind"] in {"provision_operation", "run"}
+            else self.provider.current_spend_usd_per_hour(resource_id)
+        )
         if not spend.is_finite() or spend < 0:
             raise ProviderProtocolError("provider current spend must be a non-negative Decimal")
         closeout["current_spend_usd_per_hour"] = _format_money(spend)
+        closeout["current_spend_scope"] = spend_scope
         if spend == 0:
             self._assert_closeout_ready(state)
             state["lifecycle"] = LifecycleState.CLOSED
@@ -638,7 +656,10 @@ class LifecycleController:
         return transaction.commit_state(
             "provider_spend_observed",
             state,
-            {"current_spend_usd_per_hour": _format_money(spend)},
+            {
+                "current_spend_usd_per_hour": _format_money(spend),
+                "current_spend_scope": spend_scope,
+            },
         )
 
     def _provider_termination_deadline(
@@ -661,6 +682,45 @@ class LifecycleController:
                 "provider termination deadline must be timezone-aware"
             )
         return deadline_text, deadline
+
+    def _current_spend_scope(
+        self,
+        state: Mapping[str, object],
+        closeout: Mapping[str, object],
+        resource_id: str | None,
+    ) -> dict[str, object]:
+        if resource_id is not None:
+            return {"kind": "resource", "resource_id": resource_id}
+        request = self.store.read_request(_string(state, "run_id"))
+        provider_value = request.get("provider")
+        network_volume_id = (
+            cast(Mapping[str, object], provider_value).get("network_volume_id")
+            if isinstance(provider_value, Mapping)
+            else None
+        )
+        if isinstance(network_volume_id, str) and network_volume_id:
+            operations = _object_value(state.get("operations"), "operations")
+            provision_value = operations.get("provision")
+            if provision_value is None:
+                return {"kind": "run", "proof": "provision_not_dispatched"}
+            provision = _object_value(provision_value, "provision")
+            if _integer(provision.get("attempts", 0)) == 0:
+                return {
+                    "kind": "provision_operation",
+                    "operation_id": _string(provision, "id"),
+                    "proof": "provision_not_dispatched",
+                }
+            if (
+                provision.get("status") not in _UNCERTAIN_PROVISION_STATUSES
+                or not self._provision_resolution_is_complete(state, closeout)
+            ):
+                return {"kind": "account"}
+            return {
+                "kind": "provision_operation",
+                "operation_id": _string(provision, "id"),
+                "proof": "termination_deadline_absence",
+            }
+        return {"kind": "account"}
 
     def _record_delete_receipt(
         self,
@@ -741,8 +801,9 @@ class LifecycleController:
         }
         operations = _object(state, "operations")
         operations.setdefault("delete", _new_operation(state["run_id"], "delete"))
-        if error.resource_id is not None:
-            state["resource"] = {"id": error.resource_id}
+        if error.resource_ids:
+            state["quarantined_resource_ids"] = list(error.resource_ids)
+            state["resource"] = {"id": error.resource_ids[0]}
         state["lifecycle"] = LifecycleState.DELETING
         return transaction.commit_state(
             "provider_resource_rejected",
@@ -750,17 +811,30 @@ class LifecycleController:
             {
                 "operation_id": operation_id,
                 "resource_id": error.resource_id,
+                "resource_ids": list(error.resource_ids),
                 "reason": str(error),
             },
         )
 
     def _assert_closeout_ready(self, state: Mapping[str, object]) -> None:
         closeout = _object_value(state.get("closeout"), "closeout")
+        resource_value = state.get("resource")
+        resource_id = (
+            None
+            if resource_value is None
+            else _string(_object_value(resource_value, "resource"), "id")
+        )
+        expected_spend_scope = self._current_spend_scope(
+            state,
+            closeout,
+            resource_id,
+        )
         required = (
             closeout.get("artifact_disposition") is not None,
             closeout.get("delete_acknowledged") is True,
             closeout.get("provider_not_found") is True,
             closeout.get("current_spend_usd_per_hour") == "0",
+            closeout.get("current_spend_scope") == expected_spend_scope,
             self._provision_resolution_is_complete(state, closeout),
         )
         if not all(required):

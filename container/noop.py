@@ -73,7 +73,8 @@ def main(argv: list[str]) -> int:
     phase = argv[1]
     run_id = os.environ.get("RUNPOD_JOBRUNNER_RUN_ID", "")
     storage_mount = os.environ.get("RUNPOD_JOBRUNNER_STORAGE_MOUNT", "")
-    if not run_id or not storage_mount:
+    run_root = os.environ.get("RUNPOD_JOBRUNNER_RUN_ROOT", "")
+    if not run_id or not storage_mount or not run_root:
         print("run-scoped environment is incomplete", file=sys.stderr)
         return 65
 
@@ -81,8 +82,8 @@ def main(argv: list[str]) -> int:
         time.sleep(sleep_seconds)
 
     if phase == "package":
-        storage = Path(storage_mount).resolve()
-        artifact_path = storage / "artifacts" / "noop-result.json"
+        artifacts_root = Path(run_root).resolve()
+        artifact_path = artifacts_root / "artifacts" / "noop-result.json"
         artifact_bytes = _encoded_json({"result": "noop", "run_id": run_id})
         _atomic_write(artifact_path, artifact_bytes)
         manifest = {
@@ -96,7 +97,10 @@ def main(argv: list[str]) -> int:
                 }
             ],
         }
-        _atomic_write(storage / "artifacts" / "manifest.json", _encoded_json(manifest))
+        _atomic_write(
+            artifacts_root / "artifacts" / "manifest.json",
+            _encoded_json(manifest),
+        )
 
     print(json.dumps({"phase": phase, "run_id": run_id}, sort_keys=True))
     return 0
