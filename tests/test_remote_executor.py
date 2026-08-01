@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import urllib.error
+import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from email.message import Message
@@ -432,6 +433,39 @@ class _StatusResponse(io.BytesIO):
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+def test_fetch_status_sends_product_user_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed_headers: dict[str, str] = {}
+
+    def capture(request: object, timeout: float) -> _StatusResponse:
+        assert isinstance(request, urllib.request.Request)
+        assert timeout == 15
+        observed_headers.update(dict(request.header_items()))
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "unauthorized", Message(), None
+        )
+
+    monkeypatch.setattr(
+        "runpod_jobrunner.remote_executor.urllib.request.urlopen",
+        capture,
+    )
+    run_dir = prepare_run_dir(tmp_path)
+    transfer = FakeTransfer(tmp_path / "remote")
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        sleep=lambda _seconds: None,
+    )
+
+    executor.execute(make_request(tmp_path), run_dir)
+
+    assert observed_headers["User-agent"].startswith("runpod-jobrunner/")
+    assert observed_headers["Authorization"] == "Bearer run-token"
 
 
 @pytest.mark.parametrize("body", [b"not JSON", b"[]"])

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
+from runpod_jobrunner import __version__
 from runpod_jobrunner.application import ApplicationError, ExecutionObservation
 from runpod_jobrunner.identity import RunnerIdentityError, parse_protocol_majors
 from runpod_jobrunner.incremental_ack import (
@@ -1161,7 +1162,11 @@ def _scan_host_key(host: str, port: int) -> str:
 def _fetch_status(url: str, token: str) -> Mapping[str, object]:
     request = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": f"runpod-jobrunner/{__version__}",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
