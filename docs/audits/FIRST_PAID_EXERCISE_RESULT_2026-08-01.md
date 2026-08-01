@@ -100,16 +100,27 @@ resource billing history had not yet emitted a line item at closeout, so the
 balance delta is the best available provider-side charge observation and is not
 claimed as a finalized invoice line.
 
-Budget admission was additive and conservative:
+The two budget ledgers currently contain:
 
 - scope `striatum-2026-07-31`: `$50.00` total authority, with two retained
-  `$0.50` reservations for the first two attempts;
+  `$0.50` reservations for the first two attempts and `$49.00` remaining;
 - scope `striatum-2026-07-31-amendment-1`: `$49.50` total authority, with one
-  retained `$0.50` reservation for the successful attempt.
+  retained `$0.50` reservation for the successful attempt and `$49.00`
+  remaining.
 
-The aggregate worst-case authority was `$50.50`; the principal explicitly
-accepted that as the soft-cap interpretation. Reservations are not refunded
-from observed spend, leaving `$49.00` unreserved in the amendment scope.
+`budget-ledger/1` enforces each scope independently. It has no field or check
+that links an amendment scope to a parent scope. The formal sum of the two
+per-scope totals is therefore `$99.50`, not a mechanically enforced `$50.50`
+aggregate.
+
+The principal's delegated reservation plan is narrower: `$1.00` for the first
+two attempts, `$0.50` for the successful no-op, `$2.00` for the future Qwen
+preflight, and `$47.00` for the future full run, for a planned envelope of
+`$50.50`. Those future Qwen reservations must use only the original
+`striatum-2026-07-31` scope's remaining `$49.00`. The amendment scope's
+remaining `$49.00` is intentionally unused. This allocation is an operator
+constraint; v1 does not enforce it across the two ledgers. Reservations are not
+refunded from observed spend.
 
 ## Defects found and corrected
 
@@ -141,6 +152,11 @@ from observed spend, leaving `$49.00` unreserved in the amendment scope.
   currently persist supervisor restart events.
 - Provider billing history lagged closeout. The final per-resource line item
   should be reconciled later against the recorded balance delta.
+- `budget-ledger/1` does not enforce a parent/amendment relationship or a total
+  across scope names. The operator must keep the amendment scope's remaining
+  `$49.00` unused and place future Qwen reservations only in the original scope;
+  otherwise the ledgers permit reservations beyond the delegated `$50.50`
+  plan.
 - Commit `0655c629b184bb76ca82c8c2f2d36ae11b49236c` is pushed on `main`, but the
   controller status fix has not been cut as a new packaged release.
 - A simultaneous controller-host and RunPod control-plane outage can still delay
