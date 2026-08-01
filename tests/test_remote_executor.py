@@ -1052,6 +1052,32 @@ def test_remote_executor_treats_stale_authenticated_heartbeat_as_failure(
     assert observation.detail == "authenticated remote heartbeat is stale"
 
 
+def test_remote_executor_recovers_an_authenticated_terminal_even_when_heartbeat_is_stale(
+    tmp_path: Path,
+) -> None:
+    run_dir = prepare_run_dir(tmp_path)
+    remote = tmp_path / "remote"
+    artifact, terminal = write_terminal_artifact(remote)
+    status = remote_status(terminal)
+    status["heartbeat_age_seconds"] = 47
+    transfer = FakeTransfer(remote)
+    executor = RunPodRemoteExecutor(
+        FakeAPI(),
+        ssh_key_file=tmp_path / "key",
+        transfer_factory=transfer_factory_for(transfer),
+        host_key_scanner=fixed_host_key,
+        status_fetcher=lambda _url, _token: status,
+        sleep=lambda _seconds: None,
+    )
+
+    observation = executor.execute(make_request(tmp_path), run_dir)
+
+    assert observation.result == WorkloadResult.SUCCEEDED
+    assert observation.disposition == ArtifactDisposition.VERIFIED
+    assert observation.detail.startswith("remote outcome: succeeded")
+    assert (run_dir / "receipts/artifacts/result.bin").read_bytes() == artifact
+
+
 def test_remote_executor_fails_closed_on_authenticated_runner_identity_mismatch(
     tmp_path: Path,
 ) -> None:

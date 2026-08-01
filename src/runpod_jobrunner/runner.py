@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, cast
 
 from runpod_jobrunner.identity import (
     RunnerIdentity,
@@ -280,15 +280,22 @@ class RemoteRunner:
         self._current_phase = phase
         argv = [str(argument) for argument in _sequence(phase_config["argv"], "argv")]
         self._append_event("phase_started", phase)
+        phase_log = None
         try:
+            phase_log = self._open_phase_log(phase)
             self._child = subprocess.Popen(
                 argv,
                 start_new_session=True,
                 env=self._child_environment(),
+                stdout=phase_log,
+                stderr=subprocess.STDOUT,
             )
         except OSError:
             self._append_event("phase_start_failed", phase)
             return self._terminal_result("failed", "phase_start_failed", phase)
+        finally:
+            if phase_log is not None:
+                phase_log.close()
         phase_started = time.monotonic()
         timeout_seconds = _number_as_float(phase_config["timeout_seconds"])
         heartbeat_interval = _number_as_float(self.request["heartbeat_interval_seconds"])
@@ -449,11 +456,76 @@ class RemoteRunner:
             return "storage_capacity_below_request"
         return None
 
+    def _run_root(self) -> Path:
+        storage = _mapping(self.request["storage"], "storage")
+        return (
+            Path(str(storage["mount"]))
+            / "runpod-jobrunner"
+            / "runs"
+            / self.run_id
+        )
+
+    def _phase_log_path(self, phase: str) -> Path:
+        manifest_value = self.request.get("artifact_manifest_path")
+        manifest_parent = (
+            Path(str(manifest_value)).parent
+            if isinstance(manifest_value, str)
+            else Path()
+        )
+        return self._run_root() / manifest_parent / "diagnostics" / "phases" / f"{phase}.log"
+
+    def _open_phase_log(self, phase: str) -> BinaryIO:
+        path = self._phase_log_path(phase)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, 0o600)
+        return os.fdopen(descriptor, "ab", buffering=0)
+
+    def _ensure_failure_artifact_manifest(self) -> None:
+        manifest_value = self.request.get("artifact_manifest_path")
+        if not isinstance(manifest_value, str):
+            return
+        run_root = self._run_root()
+        manifest_path = run_root / manifest_value
+        if manifest_path.exists() or manifest_path.is_symlink():
+            return
+        diagnostics = manifest_path.parent / "diagnostics" / "phases"
+        files: list[dict[str, object]] = []
+        if diagnostics.is_dir():
+            for path in sorted(diagnostics.glob("*.log")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                relative = path.relative_to(run_root).as_posix()
+                files.append(
+                    {
+                        "path": relative,
+                        "size": path.stat().st_size,
+                        "sha256": _stable_sha256(path, "artifact_hash_mismatch"),
+                    }
+                )
+        manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _atomic_write_json(
+            manifest_path,
+            {
+                "protocol": "artifact-manifest/1",
+                "run_id": self.run_id,
+                "files": files,
+            },
+        )
+
     def _finish(self, terminal_result: dict[str, object]) -> dict[str, object]:
         if (
             terminal_result.get("outcome") != "succeeded"
             and "artifact_manifest_sha256" not in terminal_result
         ):
+            with suppress(OSError, ArtifactVerificationError):
+                self._ensure_failure_artifact_manifest()
             with suppress(ArtifactVerificationError):
                 terminal_result.update(self._artifact_receipt())
         persisted = self._write_terminal_once(terminal_result)

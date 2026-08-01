@@ -79,6 +79,13 @@ creation to the first authenticated worker status by the launch-authorization
 timeout. A broken entrypoint or restart loop therefore fails into lifecycle
 cleanup instead of consuming the entire workload deadline before any phase starts.
 
+Starting with 0.1.9, each phase writes combined stdout and stderr to a durable
+run-scoped diagnostic log. A failed run creates a hash-verified fallback artifact
+manifest when the job package phase did not produce one. Authenticated immutable
+terminal status remains recoverable during its retention window even after the
+live heartbeat becomes stale; heartbeat staleness still fails ready and running
+workers.
+
 Long-running jobs can opt into incremental, content-verified artifact recovery:
 
 ```yaml

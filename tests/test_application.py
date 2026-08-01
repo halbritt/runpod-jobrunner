@@ -568,7 +568,7 @@ def test_local_failed_phase_still_deletes_and_closes(tmp_path: Path) -> None:
 
     assert state["lifecycle"] == LifecycleState.CLOSED
     assert state["workload_result"] == "failed"
-    assert state["closeout"]["artifact_disposition"]["status"] == "unavailable"
+    assert state["closeout"]["artifact_disposition"]["status"] == "partial_recovered"
     assert provider.resources == {}
 
 

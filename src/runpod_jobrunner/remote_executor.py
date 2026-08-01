@@ -213,9 +213,16 @@ class RunPodRemoteExecutor:
                 return self._permanent_failure(
                     run_dir, "authenticated remote status has an invalid heartbeat age"
                 )
-            if float(age) > stale_after:
-                return _failed("authenticated remote heartbeat is stale")
             state = status.get("state")
+            if state not in {"ready", "running", "terminal"}:
+                return self._permanent_failure(
+                    run_dir, "authenticated remote status has an invalid state"
+                )
+            # A terminal record is immutable process truth. Its heartbeat age
+            # naturally grows while the status endpoint is retained for
+            # recovery, so staleness only applies to live states.
+            if state != "terminal" and float(age) > stale_after:
+                return _failed("authenticated remote heartbeat is stale")
             if state == "ready":
                 try:
                     self._ensure_inputs_uploaded(transfer, controller, remote_root, run_dir, run_id)
@@ -229,10 +236,6 @@ class RunPodRemoteExecutor:
                     )
                 self._sleep(self._poll_interval)
                 continue
-            if state not in {"running", "terminal"}:
-                return self._permanent_failure(
-                    run_dir, "authenticated remote status has an invalid state"
-                )
             terminal_value = status.get("terminal_result")
             try:
                 self._mirror_incremental_artifacts(transfer, remote, controller, run_dir)

@@ -221,6 +221,49 @@ def test_runner_executes_enabled_phases_in_fixed_order(tmp_path: Path) -> None:
     assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
 
 
+def test_failed_phase_publishes_durable_diagnostic_artifact_manifest(
+    tmp_path: Path,
+) -> None:
+    request = make_request(tmp_path)
+    phases = cast(dict[str, dict[str, object]], request["phases"])
+    for phase in PHASE_ORDER:
+        phases[phase]["enabled"] = phase == "preflight"
+    phases["preflight"]["argv"] = [
+        sys.executable,
+        "-u",
+        "-c",
+        "import sys; print('hopper probe failed'); "
+        "print('exact cause', file=sys.stderr); sys.exit(7)",
+    ]
+    request["artifact_manifest_path"] = "artifact-manifest.json"
+
+    terminal = runner(request, tmp_path / "status").run()
+
+    assert terminal["outcome"] == "failed"
+    assert terminal["reason"] == "phase_nonzero_exit"
+    assert terminal["phase_exit_codes"] == {"preflight": 7}
+    phase_log = (
+        tmp_path
+        / "runpod-jobrunner/runs/run-test-001/diagnostics/phases/preflight.log"
+    )
+    assert phase_log.read_text() == "hopper probe failed\nexact cause\n"
+    manifest_path = tmp_path / "runpod-jobrunner/runs/run-test-001/artifact-manifest.json"
+    manifest = read_json(manifest_path)
+    assert manifest["protocol"] == "artifact-manifest/1"
+    assert manifest["run_id"] == "run-test-001"
+    assert manifest["files"] == [
+        {
+            "path": "diagnostics/phases/preflight.log",
+            "size": phase_log.stat().st_size,
+            "sha256": hashlib.sha256(phase_log.read_bytes()).hexdigest(),
+        }
+    ]
+    assert terminal["artifact_manifest_size"] == manifest_path.stat().st_size
+    assert terminal["artifact_manifest_sha256"] == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+
+
 def test_runner_accepts_an_existing_network_volume_request(tmp_path: Path) -> None:
     request = make_request(
         tmp_path,

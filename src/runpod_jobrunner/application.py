@@ -504,7 +504,11 @@ class LocalRunnerExecutor:
         except TransferError as error:
             raise ApplicationError(str(error)) from error
         _atomic_json(run_dir / "artifact-manifest.json", manifest)
-        return ArtifactDisposition.VERIFIED
+        return (
+            ArtifactDisposition.VERIFIED
+            if result == WorkloadResult.SUCCEEDED
+            else ArtifactDisposition.PARTIAL_RECOVERED
+        )
 
 
 def _durable_request(
