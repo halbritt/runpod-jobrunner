@@ -1182,7 +1182,7 @@ def test_incremental_discovery_ignores_a_sibling_runs_stale_completion(
     ]
 
 
-def test_incremental_ack_is_signed_published_and_reconciled_after_unknown_upload(
+def test_incremental_ack_is_signed_atomically_published_and_reconciled_after_unknown_move(
     tmp_path: Path,
 ) -> None:
     run_dir = prepare_run_dir(tmp_path)
@@ -1191,25 +1191,34 @@ def test_incremental_ack_is_signed_published_and_reconciled_after_unknown_upload
     write_incremental_checkpoint(remote)
     _artifact, terminal = write_terminal_artifact(remote)
 
-    class UnknownAckUploadTransfer(FakeTransfer):
+    class UnknownAckPublicationTransfer(FakeTransfer):
         def __init__(self, root: Path) -> None:
             super().__init__(root)
-            self.ack_upload_attempts = 0
+            self.ack_publication_attempts = 0
 
-        def upload(
+        def publish_atomic(
             self,
-            source_root: Path,
-            destination_root: Path | str,
-            manifest: Sequence[Mapping[str, object]],
+            source_file: Path,
+            destination_file: Path | str,
+            *,
+            size: int,
+            sha256: str,
         ) -> TransferReceipt:
-            receipt = super().upload(source_root, destination_root, manifest)
-            if str(destination_root).endswith("/control/incremental-acks"):
-                self.ack_upload_attempts += 1
-                if self.ack_upload_attempts == 1:
-                    raise TransferUnavailable("injected unknown ack upload outcome")
+            receipt = super().publish_atomic(
+                source_file,
+                destination_file,
+                size=size,
+                sha256=sha256,
+            )
+            if str(destination_file).endswith(".json") and (
+                "/control/incremental-acks/" in str(destination_file)
+            ):
+                self.ack_publication_attempts += 1
+                if self.ack_publication_attempts == 1:
+                    raise TransferUnavailable("injected unknown atomic move outcome")
             return receipt
 
-    transfer = UnknownAckUploadTransfer(remote)
+    transfer = UnknownAckPublicationTransfer(remote)
     statuses = iter(
         (
             remote_status(ack=True),
@@ -1232,7 +1241,7 @@ def test_incremental_ack_is_signed_published_and_reconciled_after_unknown_upload
     )
 
     assert observation.result == WorkloadResult.SUCCEEDED
-    assert transfer.ack_upload_attempts == 1
+    assert transfer.ack_publication_attempts == 1
     manifest_path = (
         "runpod-jobrunner/runs/run-remote/"
         "checkpoints/checkpoint-25/checkpoint-complete.json"

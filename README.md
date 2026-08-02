@@ -121,8 +121,8 @@ verified for recovery.
 The optional acknowledgement contract adds hard backpressure. Before
 provisioning, the controller creates a run-scoped Ed25519 key and sends only its
 public fields to the worker. After a checkpoint is mirrored and verified, the
-controller publishes a signed `incremental-mirror-ack/1` record into the selected
-run directory. A participating save callback must verify that run, bundle, image,
+controller atomically publishes a signed `incremental-mirror-ack/1` record into
+the selected run directory. A participating save callback must verify that run, bundle, image,
 manifest, file inventory, signer, and namespace binding before it returns.
 The acknowledgement's `manifest_path` remains relative to the storage mount, for
 example `runpod-jobrunner/runs/<run_id>/checkpoints/checkpoint-25/checkpoint-complete.json`.

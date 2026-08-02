@@ -681,10 +681,11 @@ class RunPodRemoteExecutor:
         remote_ack_root = (remote_root / ack_directory).as_posix()
         found = transfer.discover(remote_ack_root, ack_name, max_matches=1)
         if not found:
-            transfer.upload(
-                ack_root,
-                remote_ack_root,
-                [{"path": ack_name, "size": len(encoded), "sha256": ack_sha256}],
+            transfer.publish_atomic(
+                ack_path,
+                f"{remote_ack_root}/{ack_name}",
+                size=len(encoded),
+                sha256=ack_sha256,
             )
             found = transfer.discover(remote_ack_root, ack_name, max_matches=1)
         if len(found) != 1 or found[0].path != ack_name:
