@@ -381,7 +381,11 @@ def test_rclone_missing_fixed_discovery_subtree_is_an_empty_listing(tmp_path: Pa
             argv,
             3,
             stdout="",
-            stderr="Failed to lsjson: directory not found",
+            stderr=(
+                "2026/08/02 00:10:58 ERROR : : error listing: directory not found\n"
+                "2026/08/02 00:10:58 Failed to lsjson with 2 errors: "
+                "last error was: error in ListJSON: directory not found\n"
+            ),
         )
 
     transfer = RcloneSFTP(

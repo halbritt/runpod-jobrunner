@@ -377,10 +377,11 @@ class RcloneSFTP:
         ]
         result = self._run(argv, check=False, text=True, capture_output=True)
         if result.returncode != 0:
-            if re.search(
-                r"(?im)^failed to (?:lsjson|list): directory not found\s*$",
-                result.stderr.strip(),
-            ):
+            # Rclone reserves exit status 3 for a missing directory. An
+            # incremental checkpoint subtree legitimately does not exist
+            # before the first completed checkpoint, so this is an empty
+            # discovery result rather than a retryable transport failure.
+            if result.returncode == 3:
                 return ()
             raise TransferUnavailable("rclone SFTP listing outcome unknown; retry required")
         if "symlink" in result.stderr.lower():
