@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import Any
 
 import pytest
@@ -370,6 +370,33 @@ def test_rclone_list_failure_is_distinctly_retryable(tmp_path: Path) -> None:
             "checkpoints/checkpoint-*/checkpoint-complete.json",
             max_matches=8,
         )
+
+
+def test_rclone_discovery_timeout_is_bounded_and_retryable(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 AAAA\n")
+    observed: dict[str, object] = {}
+
+    def run(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+        observed.update(kwargs)
+        raise TimeoutExpired(argv, kwargs["timeout"])
+
+    transfer = RcloneSFTP(
+        host="example",
+        port=2222,
+        user="root",
+        key_file=tmp_path / "key",
+        known_hosts_file=known_hosts,
+        run_command=run,
+    )
+
+    with pytest.raises(TransferUnavailable, match="timed out"):
+        transfer.discover(
+            "/workspace/checkpoints",
+            "checkpoint-*/checkpoint-complete.json",
+            max_matches=8,
+        )
+    assert observed["timeout"] == 60
 
 
 def test_rclone_missing_fixed_discovery_subtree_is_an_empty_listing(tmp_path: Path) -> None:

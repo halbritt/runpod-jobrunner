@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import cast
 
 
@@ -59,6 +59,7 @@ class DiscoveryPattern:
 
 
 RunCommand = Callable[..., CompletedProcess[str]]
+_DISCOVERY_TIMEOUT_SECONDS = 60
 
 
 def validate_discovery_pattern(pattern: str) -> DiscoveryPattern:
@@ -375,7 +376,18 @@ class RcloneSFTP:
             "--max-depth",
             "32",
         ]
-        result = self._run(argv, check=False, text=True, capture_output=True)
+        try:
+            result = self._run(
+                argv,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=_DISCOVERY_TIMEOUT_SECONDS,
+            )
+        except TimeoutExpired as error:
+            raise TransferUnavailable(
+                "rclone SFTP listing timed out; retry required"
+            ) from error
         if result.returncode != 0:
             # Rclone reserves exit status 3 for a missing directory. An
             # incremental checkpoint subtree legitimately does not exist
